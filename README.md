@@ -24,7 +24,15 @@ Arduino IDE 2.x, esp32 core 3.x. Board settings are pinned in `sketch.json`
 Libraries: **ESP Async WebServer** and **Async TCP**, both the ESP32Async versions.
 `ModbusMaster` is *not* used — see [DESIGN_NOTES.md](DESIGN_NOTES.md).
 
-A full build takes about 90 seconds. It is not hung.
+Use `.build.ps1` — it passes a persistent `--build-path`, which is the difference
+between a **97 s** rebuild and an **11 s** one. The first build of a given board
+configuration is always ~97 s: it compiles the ESP32 core (119 files) plus
+ESPAsyncWebServer and AsyncTCP (111 files), about 20 MB of objects that never
+change afterwards. The sketch itself is only 15 files.
+
+The Arduino IDE keeps its own persistent build folder, so the same rule applies
+there — first compile slow, the rest fast. Changing any board menu option (PSRAM,
+flash size, USB CDC) changes the FQBN and forces a full rebuild.
 
 First flash: hold BOOT, tap RESET, release BOOT, then Upload.
 

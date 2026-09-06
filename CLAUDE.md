@@ -10,12 +10,15 @@ Before finishing any change pass that touches firmware:
    - major (`0.x` → `1.0.0`) — first field-deployed build, then breaking changes only
 2. Add a row to `VERSION.md` — version, date, what changed, and whether it was
    flashed to hardware.
-3. Compile before claiming done:
+3. Compile before claiming done — **always via `.\build.ps1`**, never a bare
+   `arduino-cli compile`. arduino-cli does not keep its temp build directory
+   between runs, so a bare compile rebuilds the ESP32 core and the async
+   libraries every single time: 97 s instead of 11 s. `build.ps1` passes a
+   stable `--build-path`.
    ```
-   & "C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe" `
-     --config-file "C:\Users\RyanBaird\.arduinoIDE\arduino-cli.yaml" `
-     compile --fqbn "esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi" `
-     "C:\Users\RyanBaird\Downloads\pumpsaver"
+   .\build.ps1                 # ~11 s warm, ~97 s the first time
+   .\build.ps1 -Upload         # compile then flash COM5
+   .\build.ps1 -Clean          # force a full rebuild
    ```
 4. Commit with the version in the subject: `v0.1.1 — short description`.
 
