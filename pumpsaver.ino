@@ -35,7 +35,7 @@ const char *FW_VERSION_STR = FW_VERSION;
 // Bump FW_VERSION on every change pass before flashing.  The number is shown
 // on the serial banner, in the page header and in /status, so a board in the
 // field can always be matched to a commit.  See VERSION.md for the log.
-#define FW_VERSION "0.6.0"
+#define FW_VERSION "0.7.0"
 
 // ---------------------------------------------------------------- build mode
 // 1 = simulated plant, no drive or RS485 needed.  0 = real drives over Modbus.
@@ -283,6 +283,7 @@ void commandDrive(Drive &d, bool run, float hz, bool reset) {
 #endif
 
 // ---------------------------------------------------------------- web page
+#include "config_io.h"
 #include "page.h"
 
 // ---------------------------------------------------------------- json
@@ -418,42 +419,48 @@ void setupWeb() {
   server.on("/log", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/plain", lastLog); });
 
   server.on("/set", HTTP_POST, [](AsyncWebServerRequest *r) {
+    // Read raw, then clamp once through cfgClamp(). The limits live in exactly
+    // one place (config_io.h) so this path and import can never disagree about
+    // what a legal value is.
     PumpCfg c = pc.cfg;
-    S.setpoint     = limitf(5, argF(r, "setpoint", S.setpoint), 100);
-    S.xdcrSpanPsi  = limitf(10, argF(r, "xdcrSpanPsi", S.xdcrSpanPsi), 1000);
-    c.kp           = limitf(0, argF(r, "kp", c.kp), 10);
-    c.ki           = limitf(0, argF(r, "ki", c.ki), 10);
-    c.minHz        = limitf(10, argF(r, "minHz", c.minHz), 55);
-    c.maxHz        = limitf(20, argF(r, "maxHz", c.maxHz), 60);
-    c.spRampPsiS   = limitf(0.1, argF(r, "spRampPsiS", c.spRampPsiS), 50);
-    c.spStepPsi    = limitf(1, argF(r, "spStepPsi", c.spStepPsi), 60);
-    c.shutoffPsiAt60 = limitf(20, argF(r, "shutoffPsiAt60", c.shutoffPsiAt60), 300);
-    c.capPts       = (int)limitf(2, argF(r, "capPts", c.capPts), 4);
-    for (int i = 0; i < 4; i++) {
-      c.capPsi[i]  = limitf(0, argF(r, (String("cp") + i).c_str(), c.capPsi[i]), 300);
-      c.capHzPt[i] = limitf(0, argF(r, (String("ch") + i).c_str(), c.capHzPt[i]), 60);
-    }
-    c.sleepDlyS    = limitf(5, argF(r, "sleepDlyS", c.sleepDlyS), 600);
-    c.sleepHz      = limitf(20, argF(r, "sleepHz", c.sleepHz), 60);
-    c.sleepHz2     = limitf(0, argF(r, "sleepHz2", c.sleepHz2), 10);
-    c.sleepBand    = limitf(0.2, argF(r, "sleepBand", c.sleepBand), 10);
-    c.sleepBoost   = limitf(0, argF(r, "sleepBoost", c.sleepBoost), 30);
-    c.boostMaxS    = limitf(5, argF(r, "boostMaxS", c.boostMaxS), 600);
-    c.wakeDrop     = limitf(0.5, argF(r, "wakeDrop", c.wakeDrop), 30);
-    c.sleepMinS    = limitf(0, argF(r, "sleepMinS", c.sleepMinS), 600);
-    c.idleGPM      = limitf(0, argF(r, "idleGPM", c.idleGPM), 100);
-    c.wakeGPM      = limitf(0, argF(r, "wakeGPM", c.wakeGPM), 100);
-    c.stageUpPsi   = limitf(0.5, argF(r, "stageUpPsi", c.stageUpPsi), 30);
-    c.stageUpDlyS  = limitf(1, argF(r, "stageUpDlyS", c.stageUpDlyS), 600);
-    c.stageDownHz  = limitf(20, argF(r, "stageDownHz", c.stageDownHz), 60);
-    c.stageDownDlyS= limitf(1, argF(r, "stageDownDlyS", c.stageDownDlyS), 600);
-    c.lagMinRunS   = limitf(0, argF(r, "lagMinRunS", c.lagMinRunS), 3600);
-    c.chargeRampS  = limitf(0, argF(r, "chargeRampS", c.chargeRampS), 120);
-    c.sleepHzMargin= limitf(0.05, argF(r, "sleepHzMargin", c.sleepHzMargin), 15);
-    c.sleepRelShutoff = argF(r, "sleepRelShutoff", c.sleepRelShutoff ? 1 : 0) > 0.5f;
+    S.setpoint     = argF(r, "setpoint", S.setpoint);
+    S.xdcrSpanPsi  = argF(r, "xdcrSpanPsi", S.xdcrSpanPsi);
+    S.qMax60       = argF(r, "qMax60", S.qMax60);
+    S.cavOnsetGPM  = argF(r, "cavOnsetGPM", S.cavOnsetGPM);
     S.useFlow      = argF(r, "useFlow", S.useFlow ? 1 : 0) > 0.5f;
-    S.qMax60       = limitf(1, argF(r, "qMax60", S.qMax60), 5000);
-    S.cavOnsetGPM  = limitf(1, argF(r, "cavOnsetGPM", S.cavOnsetGPM), 5000);
+    c.kp           = argF(r, "kp", c.kp);
+    c.ki           = argF(r, "ki", c.ki);
+    c.minHz        = argF(r, "minHz", c.minHz);
+    c.maxHz        = argF(r, "maxHz", c.maxHz);
+    c.spRampPsiS   = argF(r, "spRampPsiS", c.spRampPsiS);
+    c.spStepPsi    = argF(r, "spStepPsi", c.spStepPsi);
+    c.shutoffPsiAt60 = argF(r, "shutoffPsiAt60", c.shutoffPsiAt60);
+    c.capPts       = (int)argF(r, "capPts", c.capPts);
+    c.capEnable    = argF(r, "capEnable", c.capEnable ? 1 : 0) > 0.5f;
+    for (int i = 0; i < 4; i++) {
+      c.capPsi[i]  = argF(r, (String("cp") + i).c_str(), c.capPsi[i]);
+      c.capHzPt[i] = argF(r, (String("ch") + i).c_str(), c.capHzPt[i]);
+    }
+    c.sleepDlyS    = argF(r, "sleepDlyS", c.sleepDlyS);
+    c.sleepHz      = argF(r, "sleepHz", c.sleepHz);
+    c.sleepHz2     = argF(r, "sleepHz2", c.sleepHz2);
+    c.sleepHzMargin= argF(r, "sleepHzMargin", c.sleepHzMargin);
+    c.sleepRelShutoff = argF(r, "sleepRelShutoff", c.sleepRelShutoff ? 1 : 0) > 0.5f;
+    c.sleepBand    = argF(r, "sleepBand", c.sleepBand);
+    c.sleepBoost   = argF(r, "sleepBoost", c.sleepBoost);
+    c.boostMaxS    = argF(r, "boostMaxS", c.boostMaxS);
+    c.chargeRampS  = argF(r, "chargeRampS", c.chargeRampS);
+    c.wakeDrop     = argF(r, "wakeDrop", c.wakeDrop);
+    c.sleepMinS    = argF(r, "sleepMinS", c.sleepMinS);
+    c.idleGPM      = argF(r, "idleGPM", c.idleGPM);
+    c.wakeGPM      = argF(r, "wakeGPM", c.wakeGPM);
+    c.stageUpPsi   = argF(r, "stageUpPsi", c.stageUpPsi);
+    c.stageUpDlyS  = argF(r, "stageUpDlyS", c.stageUpDlyS);
+    c.stageDownHz  = argF(r, "stageDownHz", c.stageDownHz);
+    c.stageDownDlyS= argF(r, "stageDownDlyS", c.stageDownDlyS);
+    c.lagMinRunS   = argF(r, "lagMinRunS", c.lagMinRunS);
+
+    cfgClamp(S, c);
     pc.cfg = c;
     plant.qMax60       = S.qMax60;
     plant.shutoffPsi60 = c.shutoffPsiAt60;
@@ -523,6 +530,25 @@ void setupWeb() {
     r->send(200, "text/plain", c.ssid[0]
         ? "Saved -- joining network, check status in a few seconds."
         : "Saved -- no SSID set, station radio idle.");
+  });
+
+  // ---- backup / restore ----------------------------------------------
+  // Named JSON, not the NVS blob: a file written by this firmware has to stay
+  // readable by later firmware.  Passwords are never in it.
+  server.on("/export", HTTP_GET, [](AsyncWebServerRequest *r) {
+    String body = cfgExportJSON();
+    AsyncWebServerResponse *res = r->beginResponse(200, "application/json", body);
+    res->addHeader("Content-Disposition",
+                   String("attachment; filename=\"pumpsaver-") + gDevId + "-" FW_VERSION ".json\"");
+    r->send(res);
+  });
+
+  server.on("/import", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (!r->hasParam("cfg", true)) { r->send(400, "text/plain", "No config supplied."); return; }
+    bool withNet = r->hasParam("withNet", true) &&
+                   r->getParam("withNet", true)->value().toInt() > 0;
+    lastLog = cfgImportJSON(r->getParam("cfg", true)->value(), withNet);
+    r->send(200, "text/plain", lastLog);
   });
 
   server.begin();

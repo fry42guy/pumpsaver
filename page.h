@@ -218,6 +218,19 @@ around.</div>
 </form>
 </section>
 
+<section><h2>Backup &amp; restore</h2>
+<div class="hint" style="margin:0 0 8px">Every setting on this page as a JSON file &mdash; commission
+one skid, then paste the same config into the rest. <b>Passwords are never included</b>, so a config
+that gets emailed around cannot leak a customer's WiFi key. Importing applies immediately, the same
+way Save does; it cannot start a pump, because the run state is not in the file.</div>
+<button type="button" onclick="location.href='/export'">Download file</button>
+<button type="button" class="grey" onclick="showCfg()">Show / copy</button>
+<textarea id="cfgTa" rows="8" placeholder="Paste a saved config here, then Import"
+  style="width:100%;box-sizing:border-box;margin-top:8px;font-family:ui-monospace,monospace;font-size:12px;border:1px solid #bbb;border-radius:4px;padding:6px"></textarea>
+<label style="grid-template-columns:1fr 92px">Also apply network<input type="number" step="1" min="0" max="1" id="impNet" value="0"></label>
+<button type="button" class="red" onclick="doImport()">Import pasted config</button>
+</section>
+
 <pre id="log"></pre>
 </main>
 <script>
@@ -385,6 +398,22 @@ for(const el of [sd,ts,cg,sp2]){el.addEventListener('input',simDrag);el.addEvent
 for(const el of [sdv,tsv,cgv,sp2v])el.addEventListener('change',simBox);
 for(const el of [sdmin,sdmax,tsmin,tsmax,cgmin,cgmax,sp2min,sp2max])el.addEventListener('change',simRange);
 sm.addEventListener('change',simDrop);
+// ---- backup / restore ---------------------------------------------------
+async function showCfg(){
+  const t=await(await fetch('/export')).text();
+  const ta=document.getElementById('cfgTa');ta.value=t;ta.focus();ta.select();
+  try{await navigator.clipboard.writeText(t);log.textContent='Config copied to clipboard.';}
+  catch(e){log.textContent='Config shown above -- select and copy.';}
+}
+async function doImport(){
+  const t=document.getElementById('cfgTa').value.trim();
+  if(!t){log.textContent='Paste a config first.';return;}
+  const d=new URLSearchParams();
+  d.set('cfg',t);d.set('withNet',document.getElementById('impNet').value);
+  log.textContent=await(await fetch('/import',{method:'POST',body:d})).text();
+  trail=[];await loadS();await loadNet();
+}
+
 // ---- network ------------------------------------------------------------
 const nf=document.getElementById('nf');
 function pickSsid(){const v=document.getElementById('ssidSel').value;if(v)document.getElementById('ssidIn').value=v;}
