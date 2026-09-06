@@ -17,6 +17,7 @@
 - [x] Drive discovery over a range, address 1 as the uncommissioned slot
 - [x] Web UI owning every parameter
 - [x] Enable no longer persisted across power loss
+- [x] Operating-envelope plot with the true cavitation flow contour (v0.2.0)
 - [ ] **Tune Kp/Ki against the sim** and record the result
 - [ ] Verify a full sleep cycle in sim: fill → regulate → charge → asleep → wake
 - [ ] Verify staging up and down with hysteresis, and `lagMinRunS`
@@ -57,7 +58,10 @@ Blocked until the open questions are answered. Sequence once they are:
 - Desktop test harness — compile `pump_control.h` with g++ and run an 8-hour day
   in a second, for gain sweeps
 - More than two pumps (needs the control block extended past lead + lag)
-- Pressure trend graph on the web page
+- Pressure trend graph on the web page (the envelope plot is spatial, not temporal)
+- Iso-flow contours at several flows, not just at onset
+- Log the operating point to CSV alongside the existing tick data, so a field run
+  can be replayed onto the envelope afterwards
 
 ## Explicitly not doing
 

@@ -31,7 +31,7 @@
 // Bump FW_VERSION on every change pass before flashing.  The number is shown
 // on the serial banner, in the page header and in /status, so a board in the
 // field can always be matched to a commit.  See VERSION.md for the log.
-#define FW_VERSION "0.1.0"
+#define FW_VERSION "0.2.0"
 
 // ---------------------------------------------------------------- build mode
 // 1 = simulated plant, no drive or RS485 needed.  0 = real drives over Modbus.
@@ -153,11 +153,18 @@ bool  addr1Occupied = false;     // an uncommissioned drive is sitting at 1
 
 // ---------------------------------------------------------------- settings
 struct Settings {
-  uint32_t magic = 0x50535633;
+  uint32_t magic = 0x50535634;       // bump when the layout changes
   PumpCfg  c;
   float    setpoint      = 55.0f;
   float    xdcrSpanPsi   = 200.0f;   // 4-20 mA full scale on the drive's AI1
   bool     useFlow       = false;    // true only when a meter is fitted
+
+  // Pump characteristics.  Not used by the control block -- these exist so the
+  // envelope plot can draw the shutoff curve and the true cavitation flow
+  // contour that the piecewise cap table is an approximation of.
+  float    qMax60        = 142.0f;   // gpm at zero head, 60 Hz
+  float    cavOnsetGPM   = 103.0f;   // flow where the bench heard it rattle
+
   float    simDemandGPM  = 0.0f;
   float    simTimeScale  = 1.0f;
   float    simCapGalPsi  = 1.5f;
@@ -191,6 +198,8 @@ void loadSettings() {
   if (S.magic != d.magic) { S = d; lastLog = "Settings blank or old format -- defaults loaded."; }
   pc.cfg = S.c;
   plant.capacityGalPsi = S.simCapGalPsi;
+  plant.qMax60         = S.qMax60;          // sim and plot share one number
+  plant.shutoffPsi60   = S.c.shutoffPsiAt60;
 }
 void saveSettings() {
   S.c = pc.cfg;
@@ -301,6 +310,16 @@ pre{background:#eceeea;padding:8px;font-size:12px;white-space:pre-wrap;margin:8p
 </div>
 <div class="st" id="st">connecting...</div>
 
+<section><h2>Operating envelope</h2>
+<div id="gwrap" style="overflow-x:auto"><svg id="g" viewBox="0 0 520 300" style="width:100%;min-width:400px;height:auto"></svg></div>
+<div style="font-size:11px;color:#555;line-height:1.7;margin-top:4px">
+<span style="color:#b4531a">&#9473;</span> cavitation cap &nbsp;
+<span style="color:#b4531a">&#9476;</span> <span id="lgq">--</span> gpm onset &nbsp;
+<span style="color:#4a6fa5">&#9473;</span> shutoff (no flow below) &nbsp;
+<span style="color:#1a2230">&#9679;</span> now
+<div id="marg"></div></div>
+</section>
+
 <section><h2>Run</h2>
 <button onclick="sendCmd('start')">Enable</button>
 <button class="red" onclick="sendCmd('stop')">Stop</button>
@@ -331,6 +350,8 @@ pre{background:#eceeea;padding:8px;font-size:12px;white-space:pre-wrap;margin:8p
 <label>Fill ramp psi/s<input type="number" step="0.5" name="spRampPsiS"></label>
 <label>Fill preload psi<input type="number" step="1" name="spStepPsi"></label>
 <label>Shutoff psi at 60Hz<input type="number" step="1" name="shutoffPsiAt60"></label>
+<label>Free flow gpm at 60Hz<input type="number" step="1" name="qMax60"></label>
+<label>Cavitation onset gpm<input type="number" step="1" name="cavOnsetGPM"></label>
 <label>Transducer span psi<input type="number" step="5" name="xdcrSpanPsi"></label>
 </section>
 
@@ -370,6 +391,72 @@ pre{background:#eceeea;padding:8px;font-size:12px;white-space:pre-wrap;margin:8p
 <script>
 const f=document.getElementById('f');
 const SN=['idle','fill','regulate','capped','charging','asleep','staged','FAULT'];
+let SET=null,trail=[];
+
+// ---- operating envelope -------------------------------------------------
+// x = header pressure, y = speed.  Above the cap curve is forbidden; below the
+// shutoff curve the pump is deadheaded and delivering nothing.  The dashed
+// contour is the real constant-flow line at cavitation onset -- the cap table
+// is a piecewise approximation of it, and the gap between them is the margin.
+function capAt(p,cp,ch,n){
+  if(p<=cp[0])return ch[0];
+  if(p>=cp[n-1])return ch[n-1];
+  for(let i=0;i<n-1;i++)
+    if(p>=cp[i]&&p<cp[i+1])return ch[i]+(ch[i+1]-ch[i])*((p-cp[i])/(cp[i+1]-cp[i]));
+  return ch[0];
+}
+// Q(f,P) = qMax60*(f/60)*sqrt(1-P/H0),  H0 = shutoff*(f/60)^2
+function flowAt(hz,p,q0,sh){
+  const r=hz/60,h0=sh*r*r;
+  if(hz<1||p>=h0)return 0;
+  return q0*r*Math.sqrt(1-p/h0);
+}
+function drawGraph(j,s){
+  const n=s.capPts,cp=s.capPsi,ch=s.capHz,yM=s.maxHz,sh=s.shutoffPsiAt60;
+  const q0=s.qMax60,ql=s.cavOnsetGPM;
+  let xM=Math.max(60,cp[n-1]+20,s.setpoint+15);xM=Math.ceil(xM/10)*10;
+  const W=520,H=300,ML=38,MR=12,MT=12,MB=26,N=80;
+  const px=p=>ML+(p/xM)*(W-ML-MR), py=h=>H-MB-(Math.min(h,yM)/yM)*(H-MT-MB);
+  const pth=a=>a.map((v,i)=>(i?'L':'M')+px(v[0]).toFixed(1)+' '+py(v[1]).toFixed(1)).join('');
+  let cap=[],sho=[],iso=[];
+  for(let i=0;i<=N;i++){const p=xM*i/N;
+    cap.push([p,capAt(p,cp,ch,n)]);
+    sho.push([p,60*Math.sqrt(p/sh)]);
+    iso.push([p,60*Math.sqrt(Math.pow(ql/q0,2)+p/sh)]);}
+  let o='';
+  // forbidden: above the cap
+  o+='<path d="'+pth(cap)+'L'+px(xM)+' '+py(yM)+'L'+px(0)+' '+py(yM)+'Z" fill="#b4531a" opacity=".10"/>';
+  // no delivery: below shutoff
+  o+='<path d="'+pth(sho)+'L'+px(xM)+' '+py(0)+'L'+px(0)+' '+py(0)+'Z" fill="#4a6fa5" opacity=".10"/>';
+  // grid + axes
+  for(let p=0;p<=xM;p+=10){o+='<line x1="'+px(p)+'" y1="'+py(0)+'" x2="'+px(p)+'" y2="'+py(yM)+'" stroke="#ddd"/>'
+    +'<text x="'+px(p)+'" y="'+(H-9)+'" font-size="9" fill="#777" text-anchor="middle">'+p+'</text>';}
+  for(let h=0;h<=yM;h+=10){o+='<line x1="'+px(0)+'" y1="'+py(h)+'" x2="'+px(xM)+'" y2="'+py(h)+'" stroke="#ddd"/>'
+    +'<text x="'+(ML-5)+'" y="'+(py(h)+3)+'" font-size="9" fill="#777" text-anchor="end">'+h+'</text>';}
+  o+='<text x="'+(W/2)+'" y="'+(H-1)+'" font-size="9" fill="#777" text-anchor="middle">header psi</text>';
+  o+='<text x="9" y="'+(MT+8)+'" font-size="9" fill="#777">Hz</text>';
+  // min speed
+  o+='<line x1="'+px(0)+'" y1="'+py(s.minHz)+'" x2="'+px(xM)+'" y2="'+py(s.minHz)+'" stroke="#999" stroke-dasharray="2 3"/>';
+  // setpoint
+  o+='<line x1="'+px(s.setpoint)+'" y1="'+py(0)+'" x2="'+px(s.setpoint)+'" y2="'+py(yM)+'" stroke="#1f6f8b" stroke-dasharray="4 3" opacity=".7"/>';
+  // curves
+  o+='<path d="'+pth(iso)+'" fill="none" stroke="#b4531a" stroke-width="1.4" stroke-dasharray="5 4"/>';
+  o+='<path d="'+pth(sho)+'" fill="none" stroke="#4a6fa5" stroke-width="1.6"/>';
+  o+='<path d="'+pth(cap)+'" fill="none" stroke="#b4531a" stroke-width="2.2"/>';
+  // where we have been, and where we are
+  if(trail.length>1)o+='<path d="'+pth(trail)+'" fill="none" stroke="#1a2230" stroke-width="1" opacity=".35"/>';
+  if(j.state!=0)o+='<circle cx="'+px(j.psi)+'" cy="'+py(j.hzCmd)+'" r="5" fill="#1a2230"/>';
+  document.getElementById('g').innerHTML=o;
+  lgq.textContent=ql.toFixed(0);
+  // worst-case margin along the cap curve
+  let worst=0,at=0;
+  for(let i=0;i<=N;i++){const q=flowAt(cap[i][1],cap[i][0],q0,sh);if(q>worst){worst=q;at=cap[i][0];}}
+  const live=flowAt(j.hzCmd,j.psi,q0,sh);
+  marg.innerHTML='Cap curve peaks at <b>'+worst.toFixed(0)+' gpm</b> near '+at.toFixed(0)
+    +' psi &mdash; '+(ql-worst).toFixed(0)+' gpm of margin'
+    +(s.capTableOK?'':' &middot; <b style="color:#b4531a">cap table invalid, parked at row 1</b>')
+    +'<br>Now: <b>'+live.toFixed(0)+' gpm</b> at '+j.hzCmd.toFixed(1)+' Hz, '+j.psi.toFixed(1)+' psi';
+}
 async function tick(){try{const j=await(await fetch('/status')).json();
 ver.textContent='v'+j.ver;
 if(j.sim){simbar.style.display='block';simsec.style.display='block';
@@ -386,14 +473,17 @@ if(!j.psiValid)s='PRESSURE INVALID - pumps held';
 else if(j.addr1)s+=' - uncommissioned drive at address 1';
 st.textContent=s+' - sleep cycles '+j.sleepCycles;
 st.className='st'+((!j.psiValid||j.state==7)?' bad':'');
+if(SET){if(j.state!=0&&j.psiValid){trail.push([j.psi,j.hzCmd]);if(trail.length>300)trail.shift();}
+        drawGraph(j,SET);}
 const lg=await(await fetch('/log')).text();if(lg)log.textContent=lg;
 }catch(e){st.textContent='no link';st.className='st bad'}}
-async function loadS(){const j=await(await fetch('/settings')).json();
+async function loadS(){const j=await(await fetch('/settings')).json();SET=j;
 for(const k in j){const el=f.elements[k];if(el)el.value=j[k];}
 for(let i=0;i<4;i++){f.elements['cp'+i].value=j.capPsi[i];f.elements['ch'+i].value=j.capHz[i];}
 sd.value=j.simDemandGPM;ts.value=j.simTimeScale;cg.value=j.simCapGalPsi;}
 async function save(){const d=new URLSearchParams(new FormData(f));
-log.textContent=await(await fetch('/set',{method:'POST',body:d})).text();return false;}
+log.textContent=await(await fetch('/set',{method:'POST',body:d})).text();
+trail=[];await loadS();return false;}
 async function saveSim(){const d=new URLSearchParams();
 d.set('simDemandGPM',sd.value);d.set('simTimeScale',ts.value);d.set('simCapGalPsi',cg.value);
 log.textContent=await(await fetch('/sim',{method:'POST',body:d})).text();}
@@ -449,6 +539,8 @@ String settingsJSON() {
   j += ",\"stageUpPsi\":" + String(c.stageUpPsi, 1) + ",\"stageUpDlyS\":" + String(c.stageUpDlyS, 0);
   j += ",\"stageDownHz\":" + String(c.stageDownHz, 1) + ",\"stageDownDlyS\":" + String(c.stageDownDlyS, 0);
   j += ",\"lagMinRunS\":" + String(c.lagMinRunS, 0);
+  j += ",\"qMax60\":" + String(S.qMax60, 0) + ",\"cavOnsetGPM\":" + String(S.cavOnsetGPM, 0);
+  j += ",\"capTableOK\":" + String(pc.capTableOK ? "true" : "false");
   j += ",\"simDemandGPM\":" + String(S.simDemandGPM, 1);
   j += ",\"simTimeScale\":" + String(S.simTimeScale, 0);
   j += ",\"simCapGalPsi\":" + String(S.simCapGalPsi, 2) + "}";
@@ -496,7 +588,11 @@ void setupWeb() {
     c.stageDownHz  = limitf(20, argF(r, "stageDownHz", c.stageDownHz), 60);
     c.stageDownDlyS= limitf(1, argF(r, "stageDownDlyS", c.stageDownDlyS), 600);
     c.lagMinRunS   = limitf(0, argF(r, "lagMinRunS", c.lagMinRunS), 3600);
+    S.qMax60       = limitf(1, argF(r, "qMax60", S.qMax60), 5000);
+    S.cavOnsetGPM  = limitf(1, argF(r, "cavOnsetGPM", S.cavOnsetGPM), 5000);
     pc.cfg = c;
+    plant.qMax60       = S.qMax60;
+    plant.shutoffPsi60 = c.shutoffPsiAt60;
     saveSettings();
     r->send(200, "text/plain", pc.capTableOK
         ? "Saved."
