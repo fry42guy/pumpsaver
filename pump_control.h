@@ -1,0 +1,318 @@
+#pragma once
+#include <math.h>
+#include <stdint.h>
+
+/*
+  PumpControl -- faithful C++ port of FB_PumpControl (CODESYS ST).
+
+  Deliberately free of Arduino dependencies: pressure and a setpoint go in,
+  a speed and a pump count come out.  That separation is the point -- this
+  block compiles on the desktop and can be exercised against a simulated
+  plant with no hardware attached, which is how the gains should be tuned.
+
+  Caller owns: transducer validation, drive faults, run permissives, and
+  deciding which physical drive is lead this cycle.
+
+  hzCmd goes to EVERY running pump.  Parallel pumps on a common discharge
+  header must run at the same speed -- a pump turning slower than its
+  partner has a shutoff head below the header pressure, so it delivers
+  nothing while it churns.  Staging is a discrete decision (how many pumps)
+  layered on one continuous speed.
+*/
+
+enum PumpState {
+  STATE_IDLE = 0, STATE_FILL = 1, STATE_REGULATE = 2, STATE_CAPPED = 3,
+  STATE_CHARGING = 4, STATE_ASLEEP = 5, STATE_STAGED = 6, STATE_FAULT = 7
+};
+
+static inline float limitf(float lo, float v, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// TON: Q goes true once IN has been continuously true for PT seconds.
+struct Ton {
+  float acc = 0; bool q = false;
+  void run(bool in, float pt, float dt) {
+    if (in) { acc += dt; q = (acc >= pt); }
+    else    { acc = 0;   q = false; }
+  }
+};
+
+struct PumpCfg {
+  /* ---- cavitation cap table -----------------------------------------
+     Pressure -> highest safe speed.  Bench data: cavitation onset is a
+     FLOW limit near 103-107 gpm, near enough independent of speed, so a
+     discharge-pressure-indexed speed cap keeps flow under it.  Defaults
+     are the bench curve with margin; worst case along it is about 98 gpm.
+
+     Field calibration: hold each speed, open the discharge until it
+     rattles, enter (psi_onset + 6) against that Hz.  Both columns must
+     increase, and row 1 must sit above minHz, or capTableOK goes false
+     and the cap parks at row 1.                                       */
+  float capPsi[4]  = {0.0f, 26.0f, 44.0f, 44.0f};
+  float capHzPt[4] = {40.0f, 50.0f, 60.0f, 60.0f};
+  int   capPts     = 3;
+  bool  capEnable  = true;
+
+  float minHz = 30.0f;      // slowest the pump is allowed to turn
+  float maxHz = 60.0f;
+
+  float kp         = 0.60f; // Hz per psi
+  float ki         = 0.40f; // Hz per psi per second
+  float spRampPsiS = 5.0f;  // fill ramp, psi/s
+  float spStepPsi  = 20.0f; // fill preload above live pressure
+
+  /* ---- sleep ---------------------------------------------------------
+     Phase 1 at the setpoint, then charge +sleepBoost, then phase 2 at the
+     raised setpoint.  Phase 2 tests a HIGHER speed threshold, because
+     raising the head raises the no-flow speed: 55 -> 60 psi moves shutoff
+     from 48.5 to 50.7 Hz.  Both phases hold sleepDlyS, and that hold is
+     the only thing limiting cycle rate.
+
+     Speed cannot see a light draw: at 55 psi a 2 gpm draw sits at 48.55 Hz
+     against a 48.54 Hz shutoff.  So a trickle WILL duty-cycle.  sleepDlyS
+     bounds how often -- 60 s gives about 23 starts an hour on 2 gpm.    */
+  float sleepHz    = 50.0f; // phase 1 speed threshold
+  float sleepHz2   = 3.0f;  // phase 2 threshold = sleepHz + this
+  float sleepDlyS  = 60.0f;
+  float sleepBand  = 1.0f;  // pressure satisfied = SP - this
+  float sleepBoost = 5.0f;  // charge above setpoint; 0 disables
+  float spBoostMax = 90.0f;
+  float boostMaxS  = 60.0f; // time allowed to CLIMB to the charge
+  float wakeDrop   = 5.0f;  // cut-in: wake at SP - this
+  float sleepMinS  = 5.0f;
+  float idleGPM    = 2.0f;
+  float wakeGPM    = 3.0f;
+
+  /* ---- staging -------------------------------------------------------
+     Up when the lead is pinned at its cap and still losing pressure.
+     Down when one pump alone could carry the flow: at 55 psi that
+     crossover is about 51.6 Hz, so the default sits below it with
+     hysteresis.  lagMinRunS stops the lag pump short-cycling.          */
+  float stageUpPsi    = 4.0f;
+  float stageUpDlyS   = 20.0f;
+  float stageDownHz   = 46.0f;
+  float stageDownDlyS = 30.0f;
+  float lagMinRunS    = 120.0f;
+
+  float shutoffPsiAt60 = 84.0f;  // no-flow head at 60 Hz, for the affinity calc
+};
+
+struct PumpIn {
+  bool  enable    = false;  // system run demand
+  float psi       = 0;      // header pressure, validated by the caller
+  bool  psiValid  = false;  // false freezes the loop and stops the pumps
+  float setpoint  = 55.0f;  // psi
+  float flowGPM   = 0;      // 0 if not metered
+  bool  flowValid = false;  // true only when a flow meter is fitted
+  bool  lagAvail  = false;  // second pump healthy and available to stage
+};
+
+struct PumpOut {
+  float hzCmd     = 0;      // commanded speed, all running pumps
+  float capHz     = 40.0f;  // live cavitation cap, for the HMI
+  float shutoffHz = 0;      // no-flow speed at this setpoint, reference only
+  float spActive  = 0;      // setpoint the loop is chasing (incl. sleep charge)
+  bool  runLead   = false;
+  bool  runLag    = false;
+  int   state     = STATE_IDLE;
+};
+
+class PumpControl {
+public:
+  PumpCfg cfg;
+
+  // diagnostics
+  int      sleepStage   = 0;   // 0 awake, 1 charging, 2 asleep
+  uint32_t sleepCycles  = 0;
+  uint32_t boostAbandon = 0;
+  bool     capTableOK   = false;
+  float    spEff        = 0;
+  float    pidI         = 0;
+  float    psiFilt      = 0;
+
+  void reset() {
+    sleepStage = 0; spEff = 0; pidI = 0; hzCmd = 0; lagOn = false;
+    init = false; enPrev = false; tCap = 0; tPid = 0;
+    tSleepP1 = Ton(); tSleepP2 = Ton(); tSleepMin = Ton(); tBoost = Ton();
+    tStageUp = Ton(); tStageDn = Ton(); tLagRun = Ton();
+  }
+
+  void step(const PumpIn& in, PumpOut& out, float dt) {
+    // ---------------------------------------------------------- 1. SETPOINT
+    float sp  = limitf(5.0f, in.setpoint, 100.0f);
+    shutoffHz = 60.0f * sqrtf(sp / cfg.shutoffPsiAt60);   // display only
+
+    float spActive = sp;
+    if (sleepStage == 1) spActive = limitf(sp, sp + cfg.sleepBoost, cfg.spBoostMax);
+
+    if (in.psiValid) psiUse = in.psi;        // else hold the last good value
+
+    bool flowIdle = !in.flowValid || (in.flowGPM < cfg.idleGPM);
+
+    // ------------------------------------------------- 2. CAP  (100 ms tick)
+    capTableOK = (cfg.capPts >= 2) && (cfg.capPts <= 4) && (cfg.capHzPt[0] > cfg.minHz);
+    for (int i = 0; i < cfg.capPts - 1; i++)
+      if (cfg.capPsi[i+1] <= cfg.capPsi[i] || cfg.capHzPt[i+1] < cfg.capHzPt[i])
+        capTableOK = false;
+
+    tCap += dt;
+    while (tCap >= 0.1f) {
+      tCap -= 0.1f;
+      if (!init) { psiFilt = psiUse; capHz = cfg.capHzPt[0]; init = true; }
+
+      // 300 ms filter -- a protective limit must not chase transducer noise
+      psiFilt += 0.3f * (psiUse - psiFilt);
+
+      float target;
+      if (!cfg.capEnable)                            target = cfg.maxHz;
+      else if (!capTableOK || !in.psiValid)          target = cfg.capHzPt[0];  // safest
+      else if (psiFilt <= cfg.capPsi[0])             target = cfg.capHzPt[0];
+      else if (psiFilt >= cfg.capPsi[cfg.capPts-1])  target = cfg.capHzPt[cfg.capPts-1];
+      else {
+        target = cfg.capHzPt[0];
+        for (int i = 0; i < cfg.capPts - 1; i++)
+          if (psiFilt >= cfg.capPsi[i] && psiFilt < cfg.capPsi[i+1]) {
+            float span = cfg.capPsi[i+1] - cfg.capPsi[i];
+            target = cfg.capHzPt[i]
+                   + (cfg.capHzPt[i+1] - cfg.capHzPt[i]) * ((psiFilt - cfg.capPsi[i]) / span);
+          }
+      }
+
+      // down 10 Hz/s, up 3 Hz/s: protection is prompt, recovery is deliberate
+      if (capHz > target) capHz = fmaxf(target, capHz - 1.0f);
+      else                capHz = fminf(target, capHz + 0.3f);
+      capHz = limitf(cfg.capHzPt[0], capHz, cfg.maxHz);
+    }
+    float floorEff = fminf(cfg.minHz, capHz);
+
+    // ------------------------------------------------------------ 3. SLEEP
+    bool sleepP1 = in.enable && in.psiValid
+                   && (spEff >= sp - 0.1f)
+                   && (psiUse >= sp - cfg.sleepBand)
+                   && (hzCmd <= cfg.sleepHz)
+                   && flowIdle;
+
+    bool sleepP2 = in.enable && in.psiValid
+                   && (psiUse >= spActive - cfg.sleepBand)
+                   && (hzCmd <= cfg.sleepHz + cfg.sleepHz2)
+                   && flowIdle;
+
+    bool wake = (psiUse <= sp - cfg.wakeDrop)
+                || (in.flowValid && in.flowGPM > cfg.wakeGPM);
+
+    tSleepP1 .run(sleepP1 && sleepStage == 0, cfg.sleepDlyS, dt);
+    tSleepP2 .run(sleepP2 && sleepStage == 1, cfg.sleepDlyS, dt);
+    tSleepMin.run(sleepStage == 2,            cfg.sleepMinS, dt);
+    // the charge timeout counts only while still CLIMBING, otherwise it would
+    // expire while phase 2 was most of the way through its own hold
+    tBoost   .run(sleepStage == 1 && psiUse < spActive - cfg.sleepBand,
+                  cfg.boostMaxS, dt);
+
+    switch (sleepStage) {
+      case 0:
+        if (tSleepP1.q) {
+          if (cfg.sleepBoost <= 0.1f) { sleepStage = 2; sleepCycles++; }
+          else                          sleepStage = 1;
+        }
+        break;
+      case 1:
+        // Do NOT exit on "phase 1 no longer true" -- the pump runs FASTER
+        // during the charge, so that test is expected to fail here.  Demand
+        // shows up as pressure going backwards, or as flow.
+        if (tSleepP2.q)                                    { sleepStage = 2; sleepCycles++; }
+        else if (psiUse < sp - cfg.sleepBand || !flowIdle)    sleepStage = 0;
+        else if (tBoost.q) { sleepStage = 0; boostAbandon++; }  // retry later
+        break;
+      case 2:
+        if (wake && tSleepMin.q) sleepStage = 0;
+        break;
+      default: sleepStage = 0;
+    }
+    if (!in.enable || !in.psiValid) sleepStage = 0;
+
+    // ------------------------------------------------- 4. PI  (50 ms tick)
+    bool enNow = in.enable && in.psiValid;
+    if (enNow && !enPrev) {                              // R_TRIG
+      spEff = fminf(spActive, psiUse + cfg.spStepPsi);   // no step error on start
+      pidI  = floorEff;
+    }
+    enPrev = enNow;
+
+    if (!enNow) {
+      spEff = psiUse; pidI = floorEff; hzCmd = 0.0f; tPid = 0;
+    } else if (sleepStage == 2) {
+      hzCmd = 0.0f; pidI = shutoffHz; tPid = 0;   // wake from roughly the right speed
+    } else {
+      tPid += dt;
+      while (tPid >= 0.05f) {
+        tPid -= 0.05f;
+        if (spEff < spActive) spEff = fminf(spActive, spEff + cfg.spRampPsiS * 0.05f);
+        else                  spEff = spActive;  // setpoint lowered, or charge abandoned
+
+        float err  = spEff - psiUse;
+        pidI      += cfg.ki * err * 0.05f;
+        float raw  = pidI + cfg.kp * err;
+        hzCmd      = limitf(floorEff, raw, fminf(capHz, cfg.maxHz));
+
+        // anti-windup by back-calculation: whatever the clamp took away comes
+        // straight out of the integrator, so the loop leaves a limit the
+        // moment the error reverses instead of unwinding for ten seconds first
+        pidI += (hzCmd - raw);
+      }
+    }
+
+    // -------------------------------------------------- 5. LEAD/LAG STAGING
+    bool stageUp = in.enable && in.lagAvail && (sleepStage == 0)
+                   && (hzCmd >= capHz - 0.5f)
+                   && (psiUse < sp - cfg.stageUpPsi);
+    bool stageDown = !in.enable || !in.lagAvail || (sleepStage != 0)
+                     || (hzCmd <= cfg.stageDownHz);
+
+    tStageUp.run(stageUp && !lagOn,  cfg.stageUpDlyS,   dt);
+    tStageDn.run(stageDown && lagOn, cfg.stageDownDlyS, dt);
+    tLagRun .run(lagOn,              cfg.lagMinRunS,    dt);
+
+    if (tStageUp.q) lagOn = true;
+    if (tStageDn.q && (tLagRun.q || !in.enable || !in.lagAvail)) lagOn = false;
+    if (!in.enable || !in.lagAvail) lagOn = false;
+
+    // ----------------------------------------------------------- 6. OUTPUTS
+    hzCmd = limitf(0.0f, hzCmd, cfg.maxHz);
+    out.hzCmd     = hzCmd;
+    out.capHz     = capHz;
+    out.shutoffHz = shutoffHz;
+    out.spActive  = spActive;
+    out.runLead   = in.enable && in.psiValid && (sleepStage != 2);
+    out.runLag    = out.runLead && lagOn;
+
+    if      (!in.psiValid)                                out.state = STATE_FAULT;
+    else if (!in.enable)                                  out.state = STATE_IDLE;
+    else if (sleepStage == 2)                             out.state = STATE_ASLEEP;
+    else if (sleepStage == 1)                             out.state = STATE_CHARGING;
+    else if (lagOn)                                       out.state = STATE_STAGED;
+    else if (spEff < sp - 0.1f)                           out.state = STATE_FILL;
+    else if (hzCmd >= capHz - 0.2f && capHz < cfg.maxHz)  out.state = STATE_CAPPED;
+    else                                                  out.state = STATE_REGULATE;
+  }
+
+private:
+  float hzCmd = 0, capHz = 40.0f, shutoffHz = 0, psiUse = 0;
+  float tCap = 0, tPid = 0;
+  bool  init = false, enPrev = false, lagOn = false;
+  Ton   tSleepP1, tSleepP2, tSleepMin, tBoost, tStageUp, tStageDn, tLagRun;
+};
+
+static inline const char* stateName(int s) {
+  switch (s) {
+    case STATE_IDLE:     return "idle";
+    case STATE_FILL:     return "fill";
+    case STATE_REGULATE: return "regulate";
+    case STATE_CAPPED:   return "capped";
+    case STATE_CHARGING: return "charging";
+    case STATE_ASLEEP:   return "asleep";
+    case STATE_STAGED:   return "staged";
+    case STATE_FAULT:    return "FAULT";
+  }
+  return "?";
+}
