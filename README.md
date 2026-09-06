@@ -37,12 +37,23 @@ sleep state machine and staging on the bench with no drive, no motor and no wate
 
 1. Flash, open Serial Monitor at 115200. A red SIM banner prints.
 2. Join Wi-Fi **FCW-PUMP** / **fullcircle**, browse to `http://192.168.4.1`.
-3. Set **Demand gpm** to something (say 40) and **Time scale** to 10.
-4. Tap **Enable**. Watch fill → regulate, then drop demand to 1 gpm and watch it
-   charge and go to sleep.
+3. Set **Time scale ×10** and **Demand 0 gpm**. Tap **Enable**.
+4. Watch fill → regulate. It settles at 55.0 psi and **48.5 Hz** — exactly the
+   shutoff speed. After the two 60 s holds it charges to 60 psi and sleeps.
 
-Time scale compresses the control block *and* the plant together, so a 60 s sleep
-hold plays out in 6 s at ×10.
+Time scale compresses the control block *and* the plant together, so a 60 s hold
+plays out in 6 s at ×10. The sliders apply as you drag; there is no Apply button.
+
+**A pump under real demand is supposed to stay awake.** Sleep phase 1 only arms
+at or below `sleepHz` (50 Hz). At 55 psi the loop needs about **51.4 Hz** to hold
+40 gpm, so at that draw it will never sleep, and that is correct behaviour — 40 gpm
+is not a trickle. To see a full sleep/wake cycle set demand to **1–2 gpm**.
+
+| Demand | What should happen |
+|---|---|
+| 0 gpm | sleeps after both holds, stays asleep |
+| 1.5 gpm | sleeps, wakes on the 5 psi cut-in, repeats |
+| 40 gpm | never sleeps — real demand |
 
 The serial CSV is one line per 100 ms tick:
 `t_ms,psi,spAct,hzCmd,cap,shutoff,flow,state,lead,lag,sleep`
@@ -68,6 +79,7 @@ the drive stops on its own. Confirm it is set.
 | `pumpsaver.ino` | I/O, Modbus master, web UI, main tick |
 | `pump_control.h` | the control block — pure, no Arduino deps, desktop-compilable |
 | `plant_sim.h` | bench plant model |
+| `test/harness.cpp` | desktop co-simulation — runs the real control block with no board |
 | `DESIGN_NOTES.md` | decisions and why, open questions |
 | `ROADMAP.md` | phases and goal tracking |
 | `VERSION.md` | version log and flash record |

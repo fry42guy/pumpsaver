@@ -4,3 +4,6 @@ build/
 *.map
 *.hex
 .vscode/
+test/*.exe
+test/*.obj
+test/*.pdb

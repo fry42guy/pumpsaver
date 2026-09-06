@@ -31,7 +31,7 @@
 // Bump FW_VERSION on every change pass before flashing.  The number is shown
 // on the serial banner, in the page header and in /status, so a board in the
 // field can always be matched to a commit.  See VERSION.md for the log.
-#define FW_VERSION "0.2.0"
+#define FW_VERSION "0.3.0"
 
 // ---------------------------------------------------------------- build mode
 // 1 = simulated plant, no drive or RS485 needed.  0 = real drives over Modbus.
@@ -295,6 +295,11 @@ button.red{background:#b4531a}button.grey{background:#666}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:left;padding:4px 6px;border-bottom:1px solid #eee}
 .cap{display:grid;grid-template-columns:28px 1fr 1fr;gap:6px;font-size:13px;align-items:center}
+.sl{display:grid;grid-template-columns:96px 1fr 68px;gap:8px;align-items:center;font-size:14px;margin-top:8px}
+.sl input[type=range]{width:100%;margin:0}
+.sl input[type=number]{padding:4px}
+.rng{display:flex;gap:5px;align-items:center;font-size:11px;color:#888;margin:2px 0 0 96px}
+.rng input{width:56px;padding:2px 4px;font-size:11px;border:1px solid #ccc;border-radius:3px}
 pre{background:#eceeea;padding:8px;font-size:12px;white-space:pre-wrap;margin:8px 0 0}
 </style></head><body>
 <header>PumpSaver <span id="ver" style="float:right;font-weight:400;font-size:12px;opacity:.8"></span></header>
@@ -333,11 +338,15 @@ pre{background:#eceeea;padding:8px;font-size:12px;white-space:pre-wrap;margin:8p
 </section>
 
 <section id="simsec" style="display:none"><h2>Simulated plant</h2>
-<label>Demand gpm<input type="number" step="1" id="sd" value="0"></label>
-<label>Time scale x<input type="number" step="1" id="ts" value="1"></label>
-<label>Tank gal/psi<input type="number" step="0.1" id="cg" value="1.5"></label>
-<button onclick="saveSim()">Apply</button>
-<div style="font-size:12px;color:#666;margin-top:6px">Flow <b id="fl">--</b> gpm &middot; actual <b id="ha">--</b> Hz</div>
+<div class="sl"><span>Demand gpm</span><input type="range" id="sd" min="0" max="120" step="0.5"><input type="number" id="sdv" step="0.5"></div>
+<div class="rng">range<input type="number" id="sdmin" value="0"><span>to</span><input type="number" id="sdmax" value="120"></div>
+<div class="sl"><span>Time scale &times;</span><input type="range" id="ts" min="1" max="60" step="1"><input type="number" id="tsv" step="1"></div>
+<div class="rng">range<input type="number" id="tsmin" value="1"><span>to</span><input type="number" id="tsmax" value="60"></div>
+<div class="sl"><span>Tank gal/psi</span><input type="range" id="cg" min="0.2" max="10" step="0.1"><input type="number" id="cgv" step="0.1"></div>
+<div class="rng">range<input type="number" id="cgmin" value="0.2"><span>to</span><input type="number" id="cgmax" value="10"></div>
+<div style="font-size:12px;color:#666;margin-top:10px">Flow <b id="fl">--</b> gpm &middot; actual <b id="ha">--</b> Hz
+<div style="color:#888;font-size:11px;margin-top:3px">A trickle sleeps; real demand should not. At 55 psi the loop needs
+about 51.4 Hz to hold 40 gpm, and phase 1 only arms at or below <b id="shz2">50</b> Hz.</div></div>
 </section>
 
 <form id="f" onsubmit="return save()">
@@ -480,13 +489,27 @@ const lg=await(await fetch('/log')).text();if(lg)log.textContent=lg;
 async function loadS(){const j=await(await fetch('/settings')).json();SET=j;
 for(const k in j){const el=f.elements[k];if(el)el.value=j[k];}
 for(let i=0;i<4;i++){f.elements['cp'+i].value=j.capPsi[i];f.elements['ch'+i].value=j.capHz[i];}
-sd.value=j.simDemandGPM;ts.value=j.simTimeScale;cg.value=j.simCapGalPsi;}
+sd.value=j.simDemandGPM;ts.value=j.simTimeScale;cg.value=j.simCapGalPsi;
+shz2.textContent=j.sleepHz.toFixed(0);simEcho();}
+
+// Sliders: the readout follows the thumb live, the POST is debounced while
+// dragging and fires immediately on release, so there is no Apply button.
+let simT=null;
+function simEcho(){sdv.value=sd.value;tsv.value=ts.value;cgv.value=cg.value;}
+function simDrag(){simEcho();clearTimeout(simT);simT=setTimeout(pushSim,150);}
+function simDrop(){simEcho();clearTimeout(simT);pushSim();}
+function simBox(){sd.value=sdv.value;ts.value=tsv.value;cg.value=cgv.value;simDrop();}
+function simRange(){sd.min=sdmin.value;sd.max=sdmax.value;
+ ts.min=tsmin.value;ts.max=tsmax.value;cg.min=cgmin.value;cg.max=cgmax.value;simEcho();}
+async function pushSim(){const d=new URLSearchParams();
+ d.set('simDemandGPM',sd.value);d.set('simTimeScale',ts.value);d.set('simCapGalPsi',cg.value);
+ await fetch('/sim',{method:'POST',body:d});}
+for(const el of [sd,ts,cg]){el.addEventListener('input',simDrag);el.addEventListener('change',simDrop);}
+for(const el of [sdv,tsv,cgv])el.addEventListener('change',simBox);
+for(const el of [sdmin,sdmax,tsmin,tsmax,cgmin,cgmax])el.addEventListener('change',simRange);
 async function save(){const d=new URLSearchParams(new FormData(f));
 log.textContent=await(await fetch('/set',{method:'POST',body:d})).text();
 trail=[];await loadS();return false;}
-async function saveSim(){const d=new URLSearchParams();
-d.set('simDemandGPM',sd.value);d.set('simTimeScale',ts.value);d.set('simCapGalPsi',cg.value);
-log.textContent=await(await fetch('/sim',{method:'POST',body:d})).text();}
 async function sendCmd(c){log.textContent=await(await fetch('/cmd?c='+c,{method:'POST'})).text();}
 loadS();tick();setInterval(tick,1000);
 </script></body></html>)HTML";
@@ -681,10 +704,37 @@ void loop() {
   dtc = dt * S.simTimeScale;
 #endif
 
-  // ---- 1. pressure in, and decide whether to believe it
+  pin_.enable    = gEnable && !gLockout;
+  pin_.setpoint  = S.setpoint;
+  pin_.flowValid = S.useFlow;
+  pin_.lagAvail  = drv[1].present && (SIM || (drv[1].commsOK && !drv[1].tripped));
+  bool reset = (gCmdReset && now - gCmdReset < 1000);
+
 #if SIM
-  gPsiRaw   = plant.psi;
-  gPsiValid = true;
+  // Co-simulate control and plant in small fixed steps.  Integrating the whole
+  // tick in one Euler step is unstable: this plant is stiff near shutoff (at
+  // 55 psi a 0.4 Hz change swings delivery from 2 to 16 gpm), and at time
+  // scale x60 a single 6 s step overshoots setpoint by 300+ psi instead of
+  // settling at 60.  Verified in test/harness.cpp.
+  const float SUB = 0.01f;
+  int steps = (int)ceilf(dtc / SUB);
+  if (steps < 1)   steps = 1;
+  if (steps > 600) steps = 600;
+  float h = dtc / steps;
+  for (int k = 0; k < steps; k++) {
+    pin_.psi       = plant.psi;
+    pin_.psiValid  = true;
+    pin_.flowGPM   = plant.flowGPM;
+    pc.step(pin_, pout, h);
+    plant.step(pout.hzCmd, (pout.runLead ? 1 : 0) + (pout.runLag ? 1 : 0), h);
+  }
+  gPsiRaw = plant.psi; gPsiValid = true;
+
+  drv[0].running = pout.runLead; drv[0].hz = pout.runLead ? plant.hzAct : 0;
+  drv[1].running = pout.runLag;  drv[1].hz = pout.runLag  ? plant.hzAct : 0;
+  drv[0].amps = pout.runLead ? plant.amps : 0;
+  drv[1].amps = pout.runLag  ? plant.amps : 0;
+  drv[0].commsOK = drv[1].commsOK = true;
 #else
   uint16_t ai = 0;
   Drive &src = drv[0];                       // transducer lives on the lead drive
@@ -697,34 +747,13 @@ void loop() {
   } else {
     gPsiValid = false;
   }
-#endif
 
-  // ---- 2. control
-  pin_.enable    = gEnable && !gLockout;
-  pin_.psi       = gPsiRaw;
-  pin_.psiValid  = gPsiValid;
-  pin_.setpoint  = S.setpoint;
-  pin_.flowValid = S.useFlow;
-#if SIM
-  pin_.flowGPM   = plant.flowGPM;
-  pin_.flowValid = S.useFlow;
-#endif
-  pin_.lagAvail  = drv[1].present && (SIM || (drv[1].commsOK && !drv[1].tripped));
-
+  pin_.psi      = gPsiRaw;
+  pin_.psiValid = gPsiValid;
   pc.step(pin_, pout, dtc);
 
-  // ---- 3. out to the pumps.  Same speed to every running pump.
-  int running = (pout.runLead ? 1 : 0) + (pout.runLag ? 1 : 0);
-  bool reset = (gCmdReset && now - gCmdReset < 1000);
-
-#if SIM
-  plant.step(pout.hzCmd, running, dtc);
-  drv[0].running = pout.runLead; drv[0].hz = pout.runLead ? plant.hzAct : 0;
-  drv[1].running = pout.runLag;  drv[1].hz = pout.runLag  ? plant.hzAct : 0;
-  drv[0].amps = pout.runLead ? plant.amps : 0;
-  drv[1].amps = pout.runLag  ? plant.amps : 0;
-  drv[0].commsOK = drv[1].commsOK = true;
-#else
+  // Same speed to every running pump -- parallel pumps on a common discharge
+  // header must match, or the slower one sits below header pressure and churns.
   commandDrive(drv[0], pout.runLead, pout.runLead ? pout.hzCmd : 0, reset);
   commandDrive(drv[1], pout.runLag,  pout.runLag  ? pout.hzCmd : 0, reset);
   if (tickN % STATUS_EVERY == 0) { pollDrive(drv[0]); pollDrive(drv[1]); }

@@ -18,8 +18,10 @@
 - [x] Web UI owning every parameter
 - [x] Enable no longer persisted across power loss
 - [x] Operating-envelope plot with the true cavitation flow contour (v0.2.0)
+- [x] Desktop harness — real control block, no board (v0.3.0)
+- [x] Verify a full sleep cycle: fill → regulate → charge → asleep → wake
+      (harness, 1.5 gpm: 2 cycles; 0 gpm: sleeps and stays; 40 gpm: correctly never sleeps)
 - [ ] **Tune Kp/Ki against the sim** and record the result
-- [ ] Verify a full sleep cycle in sim: fill → regulate → charge → asleep → wake
 - [ ] Verify staging up and down with hysteresis, and `lagMinRunS`
 - [ ] Bench test against one real drive
 - [ ] Confirm `P-36` index 3 watchdog actually stops the drive when PumpSaver dies
