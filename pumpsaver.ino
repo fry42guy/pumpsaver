@@ -27,11 +27,15 @@
 #include "pump_control.h"
 #include "plant_sim.h"
 
+// net.h needs the version string at runtime; the macro is not visible to it.
+const char *FW_VERSION_STR = FW_VERSION;
+#include "net.h"
+
 // ---------------------------------------------------------------- version
 // Bump FW_VERSION on every change pass before flashing.  The number is shown
 // on the serial banner, in the page header and in /status, so a board in the
 // field can always be matched to a commit.  See VERSION.md for the log.
-#define FW_VERSION "0.5.0"
+#define FW_VERSION "0.6.0"
 
 // ---------------------------------------------------------------- build mode
 // 1 = simulated plant, no drive or RS485 needed.  0 = real drives over Modbus.
@@ -396,6 +400,12 @@ String settingsJSON() {
   return j;
 }
 
+void argS(AsyncWebServerRequest *r, const char *k, char *dst, size_t n) {
+  if (!r->hasParam(k, true) && !r->hasParam(k)) return;
+  String v = r->hasParam(k, true) ? r->getParam(k, true)->value() : r->getParam(k)->value();
+  strlcpy(dst, v.c_str(), n);
+}
+
 float argF(AsyncWebServerRequest *r, const char *k, float d) {
   return r->hasParam(k, true) ? r->getParam(k, true)->value().toFloat() : d;
 }
@@ -482,6 +492,39 @@ void setupWeb() {
   });
 
   server.onNotFound([](AsyncWebServerRequest *r) { r->redirect("http://192.168.4.1/"); });
+  // ---- network -------------------------------------------------------
+  server.on("/net", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send(200, "application/json", netStatusJSON());
+  });
+
+  // On-demand only.  A scan takes the radio off the AP channel for a moment.
+  server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send(200, "application/json", netScanJSON());
+  });
+
+  // Stages the change; the net task applies it.  WiFi calls must not be made
+  // from the AsyncTCP task while the net task may be mid-reconnect.
+  server.on("/net", HTTP_POST, [](AsyncWebServerRequest *r) {
+    NetCfg c = netCurrent();
+    argS(r, "ssid",  c.ssid,  sizeof(c.ssid));
+    argS(r, "host",  c.host,  sizeof(c.host));
+    argS(r, "user",  c.user,  sizeof(c.user));
+    argS(r, "topic", c.topic, sizeof(c.topic));
+    // A blank password field means "keep the stored one", so a saved network
+    // survives an edit to any other field on the page.
+    if (r->hasParam("pass", true)  && r->getParam("pass", true)->value().length())
+      argS(r, "pass",  c.pass,  sizeof(c.pass));
+    if (r->hasParam("mpass", true) && r->getParam("mpass", true)->value().length())
+      argS(r, "mpass", c.mpass, sizeof(c.mpass));
+    c.port   = (uint16_t)limitf(1, argF(r, "port", c.port), 65535);
+    c.pubMs  = (uint16_t)limitf(500, argF(r, "pubMs", c.pubMs), 60000);
+    c.mqttOn = argF(r, "mqttOn", c.mqttOn ? 1 : 0) > 0.5f;
+    netStage(c);
+    r->send(200, "text/plain", c.ssid[0]
+        ? "Saved -- joining network, check status in a few seconds."
+        : "Saved -- no SSID set, station radio idle.");
+  });
+
   server.begin();
 }
 
@@ -500,10 +543,16 @@ void setup() {
 
   for (int i = 0; i < MAX_DRIVES; i++) drv[i].addr = FIRST_ADDR + i;
 
-  WiFi.mode(WIFI_AP);
+  // AP_STA, not AP.  The config AP stays up permanently so a tech can always
+  // reach the page even when the customer network is down, misconfigured, or
+  // its password just changed.  One radio serves both: when the station side
+  // associates, the softAP follows it to that channel and anything joined to
+  // the AP is briefly dropped.  Expected -- provision, then rejoin.
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS);
   dns.start(53, "*", WiFi.softAPIP());
   setupWeb();
+  netBegin();
 
 #if SIM
   Serial.println("############################################################");
@@ -599,4 +648,16 @@ void loop() {
   Serial.printf("%lu,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%s,%d,%d,%d\n",
     now, pin_.psi, pout.spActive, pout.hzCmd, pout.capHz, pout.shutoffHz,
     plant.flowGPM, stateName(pout.state), pout.runLead, pout.runLag, pc.sleepStage);
+
+  // ---- 5. hand a snapshot to the net task.  Copy only; it publishes on its
+  //         own schedule and on its own core, so nothing here can block.
+  NetTelem tl;
+  tl.psi     = pin_.psi;      tl.spAct   = pout.spActive;
+  tl.hzCmd   = pout.hzCmd;    tl.cap     = pout.capHz;
+  tl.shutoff = pout.shutoffHz; tl.flow   = plant.flowGPM;
+  tl.state   = (int)pout.state; tl.sleepStage = pc.sleepStage;
+  tl.enable  = pin_.enable;   tl.runLead = pout.runLead;
+  tl.runLag  = pout.runLag;   tl.commsOK = drv[0].commsOK;
+  tl.psiValid = gPsiValid;    tl.upSec   = now / 1000;
+  netPushTelem(tl);
 }

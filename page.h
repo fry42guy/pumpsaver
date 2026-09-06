@@ -191,6 +191,33 @@ minimum run time are what stop it hunting in and out.</div>
 </section>
 <button type="submit">Save settings</button>
 </form>
+
+<section><h2>Network</h2>
+<div class="hint" style="margin:0 0 8px">The <b>FCW-PUMP</b> access point stays up permanently,
+so this page is reachable whether or not the site network is working. Joining the customer
+WiFi is optional and only feeds telemetry &mdash; PumpSaver never takes a command from the
+network. Scanning drops AP clients for a second: one radio has to leave the channel to look
+around.</div>
+<div id="nst" class="st">&hellip;</div>
+<form id="nf" onsubmit="return saveNet()">
+<label>SSID<span></span></label>
+<div style="display:grid;grid-template-columns:1fr auto;gap:6px;margin:0 0 6px">
+  <select id="ssidSel" onchange="pickSsid()"><option value="">-- scan or type below --</option></select>
+  <button type="button" class="grey" onclick="scan()" id="scanBtn">Scan</button>
+</div>
+<label>SSID<input name="ssid" id="ssidIn" placeholder="network name"></label>
+<label>Password<input type="password" name="pass" placeholder="unchanged"></label>
+<label>MQTT on<input type="number" step="1" min="0" max="1" name="mqttOn"></label>
+<label>Broker host<input name="host" placeholder="10.0.0.5 or broker.example.com"></label>
+<label>Broker port<input type="number" step="1" name="port"></label>
+<label>Username<input name="user" placeholder="optional"></label>
+<label>Password<input type="password" name="mpass" placeholder="unchanged"></label>
+<label>Topic prefix<input name="topic"></label>
+<label>Publish every ms<input type="number" step="100" name="pubMs"></label>
+<button type="submit">Save network</button>
+</form>
+</section>
+
 <pre id="log"></pre>
 </main>
 <script>
@@ -358,9 +385,52 @@ for(const el of [sd,ts,cg,sp2]){el.addEventListener('input',simDrag);el.addEvent
 for(const el of [sdv,tsv,cgv,sp2v])el.addEventListener('change',simBox);
 for(const el of [sdmin,sdmax,tsmin,tsmax,cgmin,cgmax,sp2min,sp2max])el.addEventListener('change',simRange);
 sm.addEventListener('change',simDrop);
+// ---- network ------------------------------------------------------------
+const nf=document.getElementById('nf');
+function pickSsid(){const v=document.getElementById('ssidSel').value;if(v)document.getElementById('ssidIn').value=v;}
+
+async function scan(){
+  const b=document.getElementById('scanBtn');b.disabled=true;b.textContent='Scanning';
+  try{
+    let j=await(await fetch('/scan')).json();
+    for(let i=0;i<12&&j.state!=='done';i++){await new Promise(r=>setTimeout(r,700));
+      j=await(await fetch('/scan')).json();}
+    const sel=document.getElementById('ssidSel');
+    sel.innerHTML='<option value="">-- scan or type below --</option>';
+    (j.nets||[]).sort((a,b)=>b.rssi-a.rssi).forEach(nw=>{
+      const o=document.createElement('option');
+      o.value=nw.ssid;o.textContent=nw.ssid+'  ('+nw.rssi+' dBm'+(nw.lock?', locked':'')+')';
+      sel.appendChild(o);});
+    if(!(j.nets||[]).length)sel.innerHTML='<option value="">no networks found</option>';
+  }catch(e){}
+  b.disabled=false;b.textContent='Scan';
+}
+
+async function loadNet(){
+  const j=await(await fetch('/net')).json();
+  for(const k of ['ssid','host','port','user','topic','pubMs'])
+    if(nf.elements[k])nf.elements[k].value=j[k];
+  nf.elements.mqttOn.value=j.mqttOn?1:0;
+  const d=document.getElementById('nst');
+  let t='AP '+j.apip+' &middot; id <b>'+j.id+'</b><br>';
+  t+= j.sta ? 'Joined <b>'+j.ssid+'</b> as '+j.ip+' ('+j.rssi+' dBm)'
+            : (j.ssid ? 'Not joined to <b>'+j.ssid+'</b> yet' : 'No network set &mdash; AP only');
+  if(j.mqttOn)t+='<br>MQTT '+(j.mqtt?'connected':'not connected'+(j.mqttFails?' ('+j.mqttFails+' tries)':''));
+  if(j.log)t+='<br>'+j.log;
+  d.innerHTML=t;d.className='st'+((j.ssid&&!j.sta)||(j.mqttOn&&!j.mqtt)?' bad':'');
+}
+
+async function saveNet(){
+  const d=new URLSearchParams(new FormData(nf));
+  const r=await fetch('/net',{method:'POST',body:d});
+  document.getElementById('log').textContent=await r.text();
+  setTimeout(loadNet,1500);
+  return false;
+}
+
 async function save(){const d=new URLSearchParams(new FormData(f));
 log.textContent=await(await fetch('/set',{method:'POST',body:d})).text();
 trail=[];await loadS();return false;}
 async function sendCmd(c){log.textContent=await(await fetch('/cmd?c='+c,{method:'POST'})).text();}
-loadS();tick();setInterval(tick,1000);
+loadS();loadNet();tick();setInterval(tick,1000);setInterval(loadNet,5000);
 </script></body></html>)HTML";

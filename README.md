@@ -21,8 +21,8 @@ parameters come from its own web UI. There is no PLC in this build — see
 Arduino IDE 2.x, esp32 core 3.x. Board settings are pinned in `sketch.json`
 (ESP32S3 Dev Module · USB CDC On Boot **Enabled** · Flash 16MB · PSRAM OPI).
 
-Libraries: **ESP Async WebServer** and **Async TCP**, both the ESP32Async versions.
-`ModbusMaster` is *not* used — see [DESIGN_NOTES.md](DESIGN_NOTES.md).
+Libraries: **ESP Async WebServer** and **Async TCP**, both the ESP32Async versions,
+plus **PubSubClient** (knolleary) for MQTT. `ModbusMaster` is *not* used — see [DESIGN_NOTES.md](DESIGN_NOTES.md).
 
 Use `.build.ps1` — it passes a persistent `--build-path`, which is the difference
 between a **97 s** rebuild and an **11 s** one. The first build of a given board
@@ -45,6 +45,10 @@ sleep state machine and staging on the bench with no drive, no motor and no wate
 
 1. Flash, open Serial Monitor at 115200. A red SIM banner prints.
 2. Join Wi-Fi **FCW-PUMP** / **fullcircle**, browse to `http://192.168.4.1`.
+   The AP stays up permanently, including once the board has joined a site
+   network — the Network card is where you scan for an SSID and point it at
+   an MQTT broker. Telemetry is publish-only; nothing is subscribed, so the
+   network cannot start, stop or re-tune a pump.
 3. Set **Time scale ×10** and **Demand 0 gpm**. Tap **Enable**.
 4. Watch fill → regulate. It settles at 55.0 psi and **48.5 Hz** — exactly the
    shutoff speed. After the two 60 s holds it charges to 60 psi and sleeps.
