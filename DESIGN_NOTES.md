@@ -105,6 +105,54 @@ The first port (`fcw_pump_retrofit.ino`) dropped logic that is now restored:
 It also had a JS bug: `<b id="cmd">` collided with `function cmd()`, so the
 Cmd/Cap tile never updated. Fixed here by renaming the id.
 
+## The sleep threshold, and why speed is a bad proxy for flow
+
+The FB used a fixed `sleepHz = 50`. Two problems, both found with the harness:
+
+**1. It breaks above ~62 psi setpoint.** Holding 70 psi needs 54.75 Hz just to reach
+shutoff, so `hzCmd <= 50` can never be true and the pump can never sleep at all. Fixed
+by measuring the threshold from the shutoff speed instead — `shutoffHz + sleepHzMargin`
+— which tracks the setpoint automatically. Phase 2 then needs no separate offset,
+because the raised charge target raises its own shutoff. `sleepRelShutoff = false`
+restores the old behaviour.
+
+At the design setpoint of 55 psi the new default (margin 1.5) gives 50.05 Hz, so
+behaviour there is unchanged.
+
+**2. Near shutoff, speed cannot resolve flow — and this is not fixable in speed.**
+At 55 psi on this pump:
+
+| Flow | Speed | Above shutoff |
+|---|---|---|
+| 0 gpm | 48.55 Hz | — |
+| 2 gpm | 48.56 Hz | 0.01 Hz |
+| 20 gpm | 49.30 Hz | 0.75 Hz |
+| 40 gpm | 51.41 Hz | 2.86 Hz |
+
+Twenty gallons a minute is *three quarters of one Hz* above dead shutoff. Any margin
+wide enough to be robust against transducer noise will also call 20 gpm idle, which is
+what makes the pump try to charge and sleep against real demand. Narrow it enough to
+exclude 20 gpm and it will chatter.
+
+**The only real fix is a flow meter.** That is exactly why `FB_PumpControl` takes
+`rFlowGPM` and `xFlowValid` — with a meter, `flowIdle` is a direct gpm comparison and 2
+vs 20 is trivial. `useFlow` is now exposed in the UI; in SIM the modelled flow feeds it,
+so the difference can be seen on the bench before buying anything.
+
+## Do not put the web page in the .ino
+
+`page.h` exists for a build reason, not a tidiness one. Arduino generates C++ forward
+prototypes by scanning `.ino` files for things that look like function definitions, and
+it does not understand raw string literals. A line reading `function drawDiag(d){`
+inside `R"HTML(...)HTML"` became a prototype at the top of the generated `.cpp`:
+
+```
+pumpsaver.ino:544:1: error: 'function' does not name a type; did you mean 'union'?
+```
+
+Arduino does not preprocess `.h` files, so the page is safe there however much
+JavaScript it grows.
+
 ## Plant model calibration
 
 `plant_sim.h` is calibrated against two numbers the control block already asserts,

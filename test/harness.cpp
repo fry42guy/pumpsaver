@@ -63,21 +63,18 @@ int main(int argc, char **argv) {
          pc.sleepCycles, pc.boostAbandon, maxPsi);
 
   if (!everSlept) {
-    // Recompute the phase-1 gates so we can say WHICH one held it awake.
-    float psiUse = pl.psi, hz = out.hzCmd;
-    bool gSpEff = pc.spEff  >= sp - 0.1f;
-    bool gPsi   = psiUse    >= sp - pc.cfg.sleepBand;
-    bool gHz    = hz        <= pc.cfg.sleepHz;
-    bool gFlow  = !in.flowValid || (in.flowGPM < pc.cfg.idleGPM);
+    const PumpDiag &d = pc.d;
     printf("\nNEVER SLEPT -- phase 1 gates at end of run:\n");
-    printf("  spEff >= sp-0.1   : %-5s (spEff %.2f, need %.2f)\n", gSpEff ? "ok" : "FAIL", pc.spEff, sp - 0.1f);
-    printf("  psi   >= sp-band  : %-5s (psi %.2f, need %.2f)\n",  gPsi ? "ok" : "FAIL", psiUse, sp - pc.cfg.sleepBand);
-    printf("  hzCmd <= sleepHz  : %-5s (hz %.2f, need <= %.2f)\n", gHz ? "ok" : "FAIL", hz, pc.cfg.sleepHz);
-    printf("  flow idle         : %-5s\n", gFlow ? "ok" : "FAIL");
-    if (!gHz)
-      printf("\n  -> the loop needs %.2f Hz to hold %.1f psi against %.1f gpm.\n"
-             "     That is real demand, not a trickle: sleepHz is %.1f.\n",
-             hz, sp, demand, pc.cfg.sleepHz);
+    printf("  spEff >= sp-0.1   : %-5s (spEff %.2f, need %.2f)\n", d.g1spEff ? "ok" : "FAIL", d.spEff, sp - 0.1f);
+    printf("  psi   >= sp-band  : %-5s (psi %.2f, need %.2f)\n",  d.g1psi ? "ok" : "FAIL", d.psiUse, sp - pc.cfg.sleepBand);
+    printf("  hzCmd <= thr1     : %-5s (hz %.2f, need <= %.2f)\n", d.g1hz ? "ok" : "FAIL", out.hzCmd, d.thr1);
+    printf("  flow idle         : %-5s\n", d.flowIdle ? "ok" : "FAIL");
+    printf("\n  shutoff at setpoint %.2f Hz, threshold %.2f Hz (margin %.2f)\n",
+           d.shutoffSP, d.thr1, d.thr1 - d.shutoffSP);
+    if (!d.g1hz)
+      printf("  -> the loop needs %.2f Hz to hold %.1f psi against %.1f gpm,\n"
+             "     which is %.2f Hz above shutoff. That is real demand.\n",
+             out.hzCmd, sp, demand, out.hzCmd - d.shutoffSP);
   }
   return 0;
 }

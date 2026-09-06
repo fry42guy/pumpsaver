@@ -53,7 +53,9 @@ Blocked until the open questions are answered. Sequence once they are:
 
 - Direct 4-20 mA transducer input (ADS1115 + 165 Ω burden) — removes the Modbus
   poll from the feedback path and kills a single point of failure
-- Flow meter input, so the sleep logic can actually see a trickle draw
+- **Flow meter** — promoted from "nice to have". Speed cannot resolve flow near
+  shutoff: at 55 psi, 20 gpm is 0.75 Hz above dead shutoff and 2 gpm is 0.01 Hz.
+  No speed threshold can separate them robustly. See DESIGN_NOTES.
 - OTA firmware update
 - Data logging to USB or SD for capturing field runs
 - AP-on-demand instead of the radio staying on permanently

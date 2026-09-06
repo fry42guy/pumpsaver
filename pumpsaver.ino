@@ -31,7 +31,7 @@
 // Bump FW_VERSION on every change pass before flashing.  The number is shown
 // on the serial banner, in the page header and in /status, so a board in the
 // field can always be matched to a commit.  See VERSION.md for the log.
-#define FW_VERSION "0.3.0"
+#define FW_VERSION "0.5.0"
 
 // ---------------------------------------------------------------- build mode
 // 1 = simulated plant, no drive or RS485 needed.  0 = real drives over Modbus.
@@ -153,7 +153,7 @@ bool  addr1Occupied = false;     // an uncommissioned drive is sitting at 1
 
 // ---------------------------------------------------------------- settings
 struct Settings {
-  uint32_t magic = 0x50535634;       // bump when the layout changes
+  uint32_t magic = 0x50535635;       // bump when the layout changes
   PumpCfg  c;
   float    setpoint      = 55.0f;
   float    xdcrSpanPsi   = 200.0f;   // 4-20 mA full scale on the drive's AI1
@@ -165,6 +165,12 @@ struct Settings {
   float    qMax60        = 142.0f;   // gpm at zero head, 60 Hz
   float    cavOnsetGPM   = 103.0f;   // flow where the bench heard it rattle
 
+  // Bench driving mode.  0 = set a draw and let the plant find its own
+  // pressure.  1 = hold the header at a pressure you choose and let the loop
+  // react to it -- an infinitely stiff source, which is the quick way to sweep
+  // the cap curve and flip the sleep gates without waiting on tank dynamics.
+  int      simMode       = 0;
+  float    simPsi        = 55.0f;
   float    simDemandGPM  = 0.0f;
   float    simTimeScale  = 1.0f;
   float    simCapGalPsi  = 1.5f;
@@ -273,246 +279,7 @@ void commandDrive(Drive &d, bool run, float hz, bool reset) {
 #endif
 
 // ---------------------------------------------------------------- web page
-const char PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>PumpSaver</title>
-<style>
-body{font-family:system-ui,sans-serif;margin:0;background:#f4f5f2;color:#1a2230}
-header{background:#1f6f8b;color:#fff;padding:14px 18px;font-weight:600;font-size:18px}
-main{padding:14px;max-width:560px;margin:auto}
-.sim{background:#8a1c1c;color:#fff;padding:10px 18px;font-weight:700;letter-spacing:.04em}
-.tiles{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
-.t{background:#fff;border-radius:6px;padding:9px 10px}
-.t small{display:block;color:#666;font-size:10px;letter-spacing:.06em;text-transform:uppercase}
-.t b{font-size:22px;font-variant-numeric:tabular-nums}
-.st{margin:12px 0;padding:10px 12px;border-radius:6px;background:#e6efe9;font-size:14px}
-.st.bad{background:#fbe6e0}
-section{background:#fff;border-radius:6px;padding:12px;margin-top:12px}
-h2{font-size:13px;margin:0 0 8px;color:#1f6f8b;text-transform:uppercase;letter-spacing:.06em}
-label{display:grid;grid-template-columns:1fr 92px;align-items:center;gap:8px;margin:5px 0;font-size:14px}
-input[type=number]{width:100%;padding:6px;font-size:15px;border:1px solid #bbb;border-radius:4px;box-sizing:border-box}
-button{padding:10px 14px;border:0;border-radius:6px;background:#1f6f8b;color:#fff;font-size:15px;margin:4px 4px 0 0}
-button.red{background:#b4531a}button.grey{background:#666}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:4px 6px;border-bottom:1px solid #eee}
-.cap{display:grid;grid-template-columns:28px 1fr 1fr;gap:6px;font-size:13px;align-items:center}
-.sl{display:grid;grid-template-columns:96px 1fr 68px;gap:8px;align-items:center;font-size:14px;margin-top:8px}
-.sl input[type=range]{width:100%;margin:0}
-.sl input[type=number]{padding:4px}
-.rng{display:flex;gap:5px;align-items:center;font-size:11px;color:#888;margin:2px 0 0 96px}
-.rng input{width:56px;padding:2px 4px;font-size:11px;border:1px solid #ccc;border-radius:3px}
-pre{background:#eceeea;padding:8px;font-size:12px;white-space:pre-wrap;margin:8px 0 0}
-</style></head><body>
-<header>PumpSaver <span id="ver" style="float:right;font-weight:400;font-size:12px;opacity:.8"></span></header>
-<div class="sim" id="simbar" style="display:none">SIMULATION - NOT CONTROLLING REAL HARDWARE</div>
-<main>
-<div class="tiles">
-<div class="t"><small>Pressure</small><b id="psi">--</b></div>
-<div class="t"><small>Setpoint</small><b id="spa">--</b></div>
-<div class="t"><small>State</small><b id="stt" style="font-size:15px">--</b></div>
-<div class="t"><small>Cmd Hz</small><b id="cmdhz">--</b></div>
-<div class="t"><small>Cap Hz</small><b id="caphz">--</b></div>
-<div class="t"><small>Shutoff</small><b id="shz">--</b></div>
-</div>
-<div class="st" id="st">connecting...</div>
-
-<section><h2>Operating envelope</h2>
-<div id="gwrap" style="overflow-x:auto"><svg id="g" viewBox="0 0 520 300" style="width:100%;min-width:400px;height:auto"></svg></div>
-<div style="font-size:11px;color:#555;line-height:1.7;margin-top:4px">
-<span style="color:#b4531a">&#9473;</span> cavitation cap &nbsp;
-<span style="color:#b4531a">&#9476;</span> <span id="lgq">--</span> gpm onset &nbsp;
-<span style="color:#4a6fa5">&#9473;</span> shutoff (no flow below) &nbsp;
-<span style="color:#1a2230">&#9679;</span> now
-<div id="marg"></div></div>
-</section>
-
-<section><h2>Run</h2>
-<button onclick="sendCmd('start')">Enable</button>
-<button class="red" onclick="sendCmd('stop')">Stop</button>
-<button class="grey" onclick="sendCmd('reset')">Fault reset</button>
-<button class="grey" onclick="sendCmd('scan')">Rescan drives</button>
-</section>
-
-<section><h2>Drives</h2>
-<table><thead><tr><th>#</th><th>Addr</th><th>Comms</th><th>Hz</th><th>A</th><th>State</th></tr></thead>
-<tbody id="drv"></tbody></table>
-</section>
-
-<section id="simsec" style="display:none"><h2>Simulated plant</h2>
-<div class="sl"><span>Demand gpm</span><input type="range" id="sd" min="0" max="120" step="0.5"><input type="number" id="sdv" step="0.5"></div>
-<div class="rng">range<input type="number" id="sdmin" value="0"><span>to</span><input type="number" id="sdmax" value="120"></div>
-<div class="sl"><span>Time scale &times;</span><input type="range" id="ts" min="1" max="60" step="1"><input type="number" id="tsv" step="1"></div>
-<div class="rng">range<input type="number" id="tsmin" value="1"><span>to</span><input type="number" id="tsmax" value="60"></div>
-<div class="sl"><span>Tank gal/psi</span><input type="range" id="cg" min="0.2" max="10" step="0.1"><input type="number" id="cgv" step="0.1"></div>
-<div class="rng">range<input type="number" id="cgmin" value="0.2"><span>to</span><input type="number" id="cgmax" value="10"></div>
-<div style="font-size:12px;color:#666;margin-top:10px">Flow <b id="fl">--</b> gpm &middot; actual <b id="ha">--</b> Hz
-<div style="color:#888;font-size:11px;margin-top:3px">A trickle sleeps; real demand should not. At 55 psi the loop needs
-about 51.4 Hz to hold 40 gpm, and phase 1 only arms at or below <b id="shz2">50</b> Hz.</div></div>
-</section>
-
-<form id="f" onsubmit="return save()">
-<section><h2>Setpoint &amp; loop</h2>
-<label>Setpoint psi<input type="number" step="0.5" name="setpoint"></label>
-<label>Kp Hz/psi<input type="number" step="0.01" name="kp"></label>
-<label>Ki Hz/psi&middot;s<input type="number" step="0.01" name="ki"></label>
-<label>Min Hz<input type="number" step="0.5" name="minHz"></label>
-<label>Max Hz<input type="number" step="0.5" name="maxHz"></label>
-<label>Fill ramp psi/s<input type="number" step="0.5" name="spRampPsiS"></label>
-<label>Fill preload psi<input type="number" step="1" name="spStepPsi"></label>
-<label>Shutoff psi at 60Hz<input type="number" step="1" name="shutoffPsiAt60"></label>
-<label>Free flow gpm at 60Hz<input type="number" step="1" name="qMax60"></label>
-<label>Cavitation onset gpm<input type="number" step="1" name="cavOnsetGPM"></label>
-<label>Transducer span psi<input type="number" step="5" name="xdcrSpanPsi"></label>
-</section>
-
-<section><h2>Cavitation cap (psi &rarr; max Hz)</h2>
-<div class="cap"><span>Pt</span><span>psi</span><span>Hz</span>
-<span>1</span><input type="number" name="cp0" step="1"><input type="number" name="ch0" step="0.5">
-<span>2</span><input type="number" name="cp1" step="1"><input type="number" name="ch1" step="0.5">
-<span>3</span><input type="number" name="cp2" step="1"><input type="number" name="ch2" step="0.5">
-<span>4</span><input type="number" name="cp3" step="1"><input type="number" name="ch3" step="0.5">
-</div><label>Points used<input type="number" name="capPts" min="2" max="4"></label>
-</section>
-
-<section><h2>Sleep</h2>
-<label>Delay s (both phases)<input type="number" step="1" name="sleepDlyS"></label>
-<label>Phase 1 Hz<input type="number" step="0.5" name="sleepHz"></label>
-<label>Phase 2 offset Hz<input type="number" step="0.5" name="sleepHz2"></label>
-<label>Band psi<input type="number" step="0.5" name="sleepBand"></label>
-<label>Charge psi (0 = off)<input type="number" step="0.5" name="sleepBoost"></label>
-<label>Charge max s<input type="number" step="1" name="boostMaxS"></label>
-<label>Wake drop psi<input type="number" step="0.5" name="wakeDrop"></label>
-<label>Min sleep s<input type="number" step="1" name="sleepMinS"></label>
-<label>Idle gpm<input type="number" step="0.5" name="idleGPM"></label>
-<label>Wake gpm<input type="number" step="0.5" name="wakeGPM"></label>
-</section>
-
-<section><h2>Staging</h2>
-<label>Stage up below SP-<input type="number" step="0.5" name="stageUpPsi"></label>
-<label>Stage up delay s<input type="number" step="1" name="stageUpDlyS"></label>
-<label>Stage down Hz<input type="number" step="0.5" name="stageDownHz"></label>
-<label>Stage down delay s<input type="number" step="1" name="stageDownDlyS"></label>
-<label>Lag min run s<input type="number" step="1" name="lagMinRunS"></label>
-</section>
-<button type="submit">Save settings</button>
-</form>
-<pre id="log"></pre>
-</main>
-<script>
-const f=document.getElementById('f');
-const SN=['idle','fill','regulate','capped','charging','asleep','staged','FAULT'];
-let SET=null,trail=[];
-
-// ---- operating envelope -------------------------------------------------
-// x = header pressure, y = speed.  Above the cap curve is forbidden; below the
-// shutoff curve the pump is deadheaded and delivering nothing.  The dashed
-// contour is the real constant-flow line at cavitation onset -- the cap table
-// is a piecewise approximation of it, and the gap between them is the margin.
-function capAt(p,cp,ch,n){
-  if(p<=cp[0])return ch[0];
-  if(p>=cp[n-1])return ch[n-1];
-  for(let i=0;i<n-1;i++)
-    if(p>=cp[i]&&p<cp[i+1])return ch[i]+(ch[i+1]-ch[i])*((p-cp[i])/(cp[i+1]-cp[i]));
-  return ch[0];
-}
-// Q(f,P) = qMax60*(f/60)*sqrt(1-P/H0),  H0 = shutoff*(f/60)^2
-function flowAt(hz,p,q0,sh){
-  const r=hz/60,h0=sh*r*r;
-  if(hz<1||p>=h0)return 0;
-  return q0*r*Math.sqrt(1-p/h0);
-}
-function drawGraph(j,s){
-  const n=s.capPts,cp=s.capPsi,ch=s.capHz,yM=s.maxHz,sh=s.shutoffPsiAt60;
-  const q0=s.qMax60,ql=s.cavOnsetGPM;
-  let xM=Math.max(60,cp[n-1]+20,s.setpoint+15);xM=Math.ceil(xM/10)*10;
-  const W=520,H=300,ML=38,MR=12,MT=12,MB=26,N=80;
-  const px=p=>ML+(p/xM)*(W-ML-MR), py=h=>H-MB-(Math.min(h,yM)/yM)*(H-MT-MB);
-  const pth=a=>a.map((v,i)=>(i?'L':'M')+px(v[0]).toFixed(1)+' '+py(v[1]).toFixed(1)).join('');
-  let cap=[],sho=[],iso=[];
-  for(let i=0;i<=N;i++){const p=xM*i/N;
-    cap.push([p,capAt(p,cp,ch,n)]);
-    sho.push([p,60*Math.sqrt(p/sh)]);
-    iso.push([p,60*Math.sqrt(Math.pow(ql/q0,2)+p/sh)]);}
-  let o='';
-  // forbidden: above the cap
-  o+='<path d="'+pth(cap)+'L'+px(xM)+' '+py(yM)+'L'+px(0)+' '+py(yM)+'Z" fill="#b4531a" opacity=".10"/>';
-  // no delivery: below shutoff
-  o+='<path d="'+pth(sho)+'L'+px(xM)+' '+py(0)+'L'+px(0)+' '+py(0)+'Z" fill="#4a6fa5" opacity=".10"/>';
-  // grid + axes
-  for(let p=0;p<=xM;p+=10){o+='<line x1="'+px(p)+'" y1="'+py(0)+'" x2="'+px(p)+'" y2="'+py(yM)+'" stroke="#ddd"/>'
-    +'<text x="'+px(p)+'" y="'+(H-9)+'" font-size="9" fill="#777" text-anchor="middle">'+p+'</text>';}
-  for(let h=0;h<=yM;h+=10){o+='<line x1="'+px(0)+'" y1="'+py(h)+'" x2="'+px(xM)+'" y2="'+py(h)+'" stroke="#ddd"/>'
-    +'<text x="'+(ML-5)+'" y="'+(py(h)+3)+'" font-size="9" fill="#777" text-anchor="end">'+h+'</text>';}
-  o+='<text x="'+(W/2)+'" y="'+(H-1)+'" font-size="9" fill="#777" text-anchor="middle">header psi</text>';
-  o+='<text x="9" y="'+(MT+8)+'" font-size="9" fill="#777">Hz</text>';
-  // min speed
-  o+='<line x1="'+px(0)+'" y1="'+py(s.minHz)+'" x2="'+px(xM)+'" y2="'+py(s.minHz)+'" stroke="#999" stroke-dasharray="2 3"/>';
-  // setpoint
-  o+='<line x1="'+px(s.setpoint)+'" y1="'+py(0)+'" x2="'+px(s.setpoint)+'" y2="'+py(yM)+'" stroke="#1f6f8b" stroke-dasharray="4 3" opacity=".7"/>';
-  // curves
-  o+='<path d="'+pth(iso)+'" fill="none" stroke="#b4531a" stroke-width="1.4" stroke-dasharray="5 4"/>';
-  o+='<path d="'+pth(sho)+'" fill="none" stroke="#4a6fa5" stroke-width="1.6"/>';
-  o+='<path d="'+pth(cap)+'" fill="none" stroke="#b4531a" stroke-width="2.2"/>';
-  // where we have been, and where we are
-  if(trail.length>1)o+='<path d="'+pth(trail)+'" fill="none" stroke="#1a2230" stroke-width="1" opacity=".35"/>';
-  if(j.state!=0)o+='<circle cx="'+px(j.psi)+'" cy="'+py(j.hzCmd)+'" r="5" fill="#1a2230"/>';
-  document.getElementById('g').innerHTML=o;
-  lgq.textContent=ql.toFixed(0);
-  // worst-case margin along the cap curve
-  let worst=0,at=0;
-  for(let i=0;i<=N;i++){const q=flowAt(cap[i][1],cap[i][0],q0,sh);if(q>worst){worst=q;at=cap[i][0];}}
-  const live=flowAt(j.hzCmd,j.psi,q0,sh);
-  marg.innerHTML='Cap curve peaks at <b>'+worst.toFixed(0)+' gpm</b> near '+at.toFixed(0)
-    +' psi &mdash; '+(ql-worst).toFixed(0)+' gpm of margin'
-    +(s.capTableOK?'':' &middot; <b style="color:#b4531a">cap table invalid, parked at row 1</b>')
-    +'<br>Now: <b>'+live.toFixed(0)+' gpm</b> at '+j.hzCmd.toFixed(1)+' Hz, '+j.psi.toFixed(1)+' psi';
-}
-async function tick(){try{const j=await(await fetch('/status')).json();
-ver.textContent='v'+j.ver;
-if(j.sim){simbar.style.display='block';simsec.style.display='block';
-  fl.textContent=j.flow.toFixed(1);ha.textContent=j.hzAct.toFixed(1);}
-psi.textContent=j.psi.toFixed(1);spa.textContent=j.spActive.toFixed(1);
-stt.textContent=SN[j.state];cmdhz.textContent=j.hzCmd.toFixed(1);
-caphz.textContent=j.capHz.toFixed(1);shz.textContent=j.shutoffHz.toFixed(1);
-let r='';for(const d of j.drives){r+='<tr><td>'+d.n+'</td><td>'+d.addr+'</td><td>'+
- (d.present?(d.commsOK?'ok':'LOST'):'-')+'</td><td>'+d.hz.toFixed(1)+'</td><td>'+
- d.amps.toFixed(1)+'</td><td>'+(d.tripped?('TRIP '+d.tripCode):(d.running?'run':'stop'))+
- '</td></tr>';}drv.innerHTML=r;
-let s=j.enable?'Enabled':'Disabled';
-if(!j.psiValid)s='PRESSURE INVALID - pumps held';
-else if(j.addr1)s+=' - uncommissioned drive at address 1';
-st.textContent=s+' - sleep cycles '+j.sleepCycles;
-st.className='st'+((!j.psiValid||j.state==7)?' bad':'');
-if(SET){if(j.state!=0&&j.psiValid){trail.push([j.psi,j.hzCmd]);if(trail.length>300)trail.shift();}
-        drawGraph(j,SET);}
-const lg=await(await fetch('/log')).text();if(lg)log.textContent=lg;
-}catch(e){st.textContent='no link';st.className='st bad'}}
-async function loadS(){const j=await(await fetch('/settings')).json();SET=j;
-for(const k in j){const el=f.elements[k];if(el)el.value=j[k];}
-for(let i=0;i<4;i++){f.elements['cp'+i].value=j.capPsi[i];f.elements['ch'+i].value=j.capHz[i];}
-sd.value=j.simDemandGPM;ts.value=j.simTimeScale;cg.value=j.simCapGalPsi;
-shz2.textContent=j.sleepHz.toFixed(0);simEcho();}
-
-// Sliders: the readout follows the thumb live, the POST is debounced while
-// dragging and fires immediately on release, so there is no Apply button.
-let simT=null;
-function simEcho(){sdv.value=sd.value;tsv.value=ts.value;cgv.value=cg.value;}
-function simDrag(){simEcho();clearTimeout(simT);simT=setTimeout(pushSim,150);}
-function simDrop(){simEcho();clearTimeout(simT);pushSim();}
-function simBox(){sd.value=sdv.value;ts.value=tsv.value;cg.value=cgv.value;simDrop();}
-function simRange(){sd.min=sdmin.value;sd.max=sdmax.value;
- ts.min=tsmin.value;ts.max=tsmax.value;cg.min=cgmin.value;cg.max=cgmax.value;simEcho();}
-async function pushSim(){const d=new URLSearchParams();
- d.set('simDemandGPM',sd.value);d.set('simTimeScale',ts.value);d.set('simCapGalPsi',cg.value);
- await fetch('/sim',{method:'POST',body:d});}
-for(const el of [sd,ts,cg]){el.addEventListener('input',simDrag);el.addEventListener('change',simDrop);}
-for(const el of [sdv,tsv,cgv])el.addEventListener('change',simBox);
-for(const el of [sdmin,sdmax,tsmin,tsmax,cgmin,cgmax])el.addEventListener('change',simRange);
-async function save(){const d=new URLSearchParams(new FormData(f));
-log.textContent=await(await fetch('/set',{method:'POST',body:d})).text();
-trail=[];await loadS();return false;}
-async function sendCmd(c){log.textContent=await(await fetch('/cmd?c='+c,{method:'POST'})).text();}
-loadS();tick();setInterval(tick,1000);
-</script></body></html>)HTML";
+#include "page.h"
 
 // ---------------------------------------------------------------- json
 String statusJSON() {
@@ -541,6 +308,60 @@ String statusJSON() {
   return j;
 }
 
+// Delivery at a given speed and header pressure, from the same affinity-law
+// curve the envelope plot draws.  Used to say what a speed threshold means in
+// gpm, because "50 Hz" tells an operator nothing.
+float flowAt(float hz, float psi) {
+  float r = hz / 60.0f, h0 = pc.cfg.shutoffPsiAt60 * r * r;
+  if (hz < 1.0f || psi >= h0) return 0.0f;
+  return S.qMax60 * r * sqrtf(1.0f - psi / h0);
+}
+
+String diagJSON() {
+  const PumpDiag &d = pc.d;
+  PumpCfg &c = pc.cfg;
+  String j = "{";
+  j += "\"sp\":" + String(d.sp, 1) + ",\"spActive\":" + String(d.spActive, 1);
+  j += ",\"spEff\":" + String(d.spEff, 2) + ",\"psi\":" + String(d.psiUse, 2);
+  j += ",\"err\":" + String(d.err, 2) + ",\"p\":" + String(d.pTerm, 2);
+  j += ",\"i\":" + String(d.iTerm, 2) + ",\"raw\":" + String(d.raw, 2);
+  j += ",\"clamp\":" + String(d.clamp, 2) + ",\"hz\":" + String(pout.hzCmd, 2);
+  j += ",\"floor\":" + String(d.floorEff, 1) + ",\"cap\":" + String(pout.capHz, 2);
+  j += ",\"capTgt\":" + String(d.capTarget, 2) + ",\"psiFilt\":" + String(d.psiFilt, 2);
+  j += ",\"iAtFloor\":" + String(d.iAtFloor ? "true" : "false");
+  j += ",\"iAtCap\":" + String(d.iAtCap ? "true" : "false");
+  j += ",\"capOK\":" + String(pc.capTableOK ? "true" : "false");
+  j += ",\"shSP\":" + String(d.shutoffSP, 2) + ",\"shAct\":" + String(d.shutoffActive, 2);
+  j += ",\"thr1\":" + String(d.thr1, 2) + ",\"thr2\":" + String(d.thr2, 2);
+  j += ",\"thr1gpm\":" + String(flowAt(d.thr1, d.sp), 1);
+  j += ",\"thr2gpm\":" + String(flowAt(d.thr2, d.spActive), 1);
+  j += ",\"nowgpm\":" + String(flowAt(pout.hzCmd, d.psiUse), 1);
+  j += ",\"stage\":" + String(pc.sleepStage);
+  j += ",\"g1spEff\":" + String(d.g1spEff ? "true" : "false");
+  j += ",\"g1psi\":" + String(d.g1psi ? "true" : "false");
+  j += ",\"g1hz\":" + String(d.g1hz ? "true" : "false");
+  j += ",\"g2psi\":" + String(d.g2psi ? "true" : "false");
+  j += ",\"g2hz\":" + String(d.g2hz ? "true" : "false");
+  j += ",\"flowIdle\":" + String(d.flowIdle ? "true" : "false");
+  j += ",\"useFlow\":" + String(S.useFlow ? "true" : "false");
+  j += ",\"flowGPM\":" + String(pin_.flowGPM, 1);
+  j += ",\"wake\":" + String(d.wake ? "true" : "false");
+  j += ",\"tP1\":" + String(d.tP1, 1) + ",\"tP2\":" + String(d.tP2, 1);
+  j += ",\"tMin\":" + String(d.tMin, 1) + ",\"tBst\":" + String(d.tBst, 1);
+  j += ",\"dly\":" + String(c.sleepDlyS, 0) + ",\"minS\":" + String(c.sleepMinS, 0);
+  j += ",\"bstS\":" + String(c.boostMaxS, 0);
+  j += ",\"tUp\":" + String(d.tUp, 1) + ",\"tDn\":" + String(d.tDn, 1);
+  j += ",\"tLag\":" + String(d.tLag, 1);
+  j += ",\"upS\":" + String(c.stageUpDlyS, 0) + ",\"dnS\":" + String(c.stageDownDlyS, 0);
+  j += ",\"lagS\":" + String(c.lagMinRunS, 0);
+  j += ",\"stageUp\":" + String(d.stageUp ? "true" : "false");
+  j += ",\"stageDown\":" + String(d.stageDown ? "true" : "false");
+  j += ",\"lagOn\":" + String(d.lagOn ? "true" : "false");
+  j += ",\"kp\":" + String(c.kp, 2) + ",\"ki\":" + String(c.ki, 2);
+  j += ",\"abandons\":" + String(pc.boostAbandon) + "}";
+  return j;
+}
+
 String settingsJSON() {
   PumpCfg &c = pc.cfg;
   String j = "{";
@@ -562,8 +383,13 @@ String settingsJSON() {
   j += ",\"stageUpPsi\":" + String(c.stageUpPsi, 1) + ",\"stageUpDlyS\":" + String(c.stageUpDlyS, 0);
   j += ",\"stageDownHz\":" + String(c.stageDownHz, 1) + ",\"stageDownDlyS\":" + String(c.stageDownDlyS, 0);
   j += ",\"lagMinRunS\":" + String(c.lagMinRunS, 0);
+  j += ",\"chargeRampS\":" + String(c.chargeRampS, 1);
+  j += ",\"sleepHzMargin\":" + String(c.sleepHzMargin, 2);
+  j += ",\"sleepRelShutoff\":" + String(c.sleepRelShutoff ? 1 : 0);
+  j += ",\"useFlow\":" + String(S.useFlow ? 1 : 0);
   j += ",\"qMax60\":" + String(S.qMax60, 0) + ",\"cavOnsetGPM\":" + String(S.cavOnsetGPM, 0);
   j += ",\"capTableOK\":" + String(pc.capTableOK ? "true" : "false");
+  j += ",\"simMode\":" + String(S.simMode) + ",\"simPsi\":" + String(S.simPsi, 1);
   j += ",\"simDemandGPM\":" + String(S.simDemandGPM, 1);
   j += ",\"simTimeScale\":" + String(S.simTimeScale, 0);
   j += ",\"simCapGalPsi\":" + String(S.simCapGalPsi, 2) + "}";
@@ -578,6 +404,7 @@ void setupWeb() {
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE); });
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "application/json", statusJSON()); });
   server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "application/json", settingsJSON()); });
+  server.on("/diag", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "application/json", diagJSON()); });
   server.on("/log", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/plain", lastLog); });
 
   server.on("/set", HTTP_POST, [](AsyncWebServerRequest *r) {
@@ -611,6 +438,10 @@ void setupWeb() {
     c.stageDownHz  = limitf(20, argF(r, "stageDownHz", c.stageDownHz), 60);
     c.stageDownDlyS= limitf(1, argF(r, "stageDownDlyS", c.stageDownDlyS), 600);
     c.lagMinRunS   = limitf(0, argF(r, "lagMinRunS", c.lagMinRunS), 3600);
+    c.chargeRampS  = limitf(0, argF(r, "chargeRampS", c.chargeRampS), 120);
+    c.sleepHzMargin= limitf(0.05, argF(r, "sleepHzMargin", c.sleepHzMargin), 15);
+    c.sleepRelShutoff = argF(r, "sleepRelShutoff", c.sleepRelShutoff ? 1 : 0) > 0.5f;
+    S.useFlow      = argF(r, "useFlow", S.useFlow ? 1 : 0) > 0.5f;
     S.qMax60       = limitf(1, argF(r, "qMax60", S.qMax60), 5000);
     S.cavOnsetGPM  = limitf(1, argF(r, "cavOnsetGPM", S.cavOnsetGPM), 5000);
     pc.cfg = c;
@@ -623,6 +454,8 @@ void setupWeb() {
   });
 
   server.on("/sim", HTTP_POST, [](AsyncWebServerRequest *r) {
+    S.simMode      = (int)limitf(0, argF(r, "simMode", S.simMode), 1);
+    S.simPsi       = limitf(0, argF(r, "simPsi", S.simPsi), 300);
     S.simDemandGPM = limitf(0, argF(r, "simDemandGPM", S.simDemandGPM), 400);
     S.simTimeScale = limitf(1, argF(r, "simTimeScale", S.simTimeScale), 60);
     S.simCapGalPsi = limitf(0.1, argF(r, "simCapGalPsi", S.simCapGalPsi), 50);
@@ -727,6 +560,9 @@ void loop() {
     pin_.flowGPM   = plant.flowGPM;
     pc.step(pin_, pout, h);
     plant.step(pout.hzCmd, (pout.runLead ? 1 : 0) + (pout.runLag ? 1 : 0), h);
+    // Pressure-hold mode: the header is an infinitely stiff source at whatever
+    // the operator dialled in, so whatever the pump just did to it is discarded.
+    if (S.simMode == 1) plant.psi = S.simPsi;
   }
   gPsiRaw = plant.psi; gPsiValid = true;
 

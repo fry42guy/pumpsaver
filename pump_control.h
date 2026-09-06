@@ -72,9 +72,20 @@ struct PumpCfg {
      Speed cannot see a light draw: at 55 psi a 2 gpm draw sits at 48.55 Hz
      against a 48.54 Hz shutoff.  So a trickle WILL duty-cycle.  sleepDlyS
      bounds how often -- 60 s gives about 23 starts an hour on 2 gpm.    */
-  float sleepHz    = 50.0f; // phase 1 speed threshold
-  float sleepHz2   = 3.0f;  // phase 2 threshold = sleepHz + this
+  /* A FIXED speed threshold breaks as soon as the setpoint moves.  Holding
+     70 psi needs 54.8 Hz just to reach shutoff, so with sleepHz = 50 the pump
+     can never sleep at any setpoint above about 62 psi -- verified in
+     test/harness.cpp.  Measuring the threshold from the shutoff speed instead
+     tracks the setpoint automatically, and phase 2 then needs no separate
+     offset: the raised charge target raises its own shutoff.
+
+     sleepRelShutoff = false restores the original fixed-threshold behaviour. */
+  bool  sleepRelShutoff = true;
+  float sleepHzMargin   = 1.5f;  // threshold = shutoff speed + this
+  float sleepHz    = 50.0f; // phase 1 threshold when sleepRelShutoff is false
+  float sleepHz2   = 3.0f;  // phase 2 offset  when sleepRelShutoff is false
   float sleepDlyS  = 60.0f;
+  float chargeRampS = 3.0f; // seconds to ease the setpoint up into the charge
   float sleepBand  = 1.0f;  // pressure satisfied = SP - this
   float sleepBoost = 5.0f;  // charge above setpoint; 0 disables
   float spBoostMax = 90.0f;
@@ -118,9 +129,26 @@ struct PumpOut {
   int   state     = STATE_IDLE;
 };
 
+// Everything the loop is thinking, for the troubleshooting dashboard.  Written
+// once per step; never read back by the control logic.
+struct PumpDiag {
+  float sp = 0, spActive = 0, spEff = 0, err = 0;
+  float pTerm = 0, iTerm = 0, raw = 0, clamp = 0;   // clamp = anti-windup correction
+  float floorEff = 0, capTarget = 0, psiFilt = 0, psiUse = 0;
+  float shutoffSP = 0, shutoffActive = 0, thr1 = 0, thr2 = 0;
+  bool  iAtFloor = false, iAtCap = false;           // integrator pinned?
+  bool  flowIdle = false, wake = false;
+  bool  g1spEff = false, g1psi = false, g1hz = false;   // phase 1 gates
+  bool  g2psi = false, g2hz = false;                    // phase 2 gates
+  float tP1 = 0, tP2 = 0, tMin = 0, tBst = 0;
+  float tUp = 0, tDn = 0, tLag = 0;
+  bool  stageUp = false, stageDown = false, lagOn = false;
+};
+
 class PumpControl {
 public:
-  PumpCfg cfg;
+  PumpCfg  cfg;
+  PumpDiag d;
 
   // diagnostics
   int      sleepStage   = 0;   // 0 awake, 1 charging, 2 asleep
@@ -180,6 +208,7 @@ public:
       }
 
       // down 10 Hz/s, up 3 Hz/s: protection is prompt, recovery is deliberate
+      d.capTarget = target;
       if (capHz > target) capHz = fmaxf(target, capHz - 1.0f);
       else                capHz = fminf(target, capHz + 0.3f);
       capHz = limitf(cfg.capHzPt[0], capHz, cfg.maxHz);
@@ -187,16 +216,21 @@ public:
     float floorEff = fminf(cfg.minHz, capHz);
 
     // ------------------------------------------------------------ 3. SLEEP
-    bool sleepP1 = in.enable && in.psiValid
-                   && (spEff >= sp - 0.1f)
-                   && (psiUse >= sp - cfg.sleepBand)
-                   && (hzCmd <= cfg.sleepHz)
-                   && flowIdle;
+    // Thresholds measured from the shutoff speed track the setpoint; phase 2
+    // gets its own because the charge target has a higher shutoff of its own.
+    float shutoffActive = 60.0f * sqrtf(spActive / cfg.shutoffPsiAt60);
+    float thr1 = cfg.sleepRelShutoff ? shutoffHz     + cfg.sleepHzMargin : cfg.sleepHz;
+    float thr2 = cfg.sleepRelShutoff ? shutoffActive + cfg.sleepHzMargin
+                                     : cfg.sleepHz + cfg.sleepHz2;
 
-    bool sleepP2 = in.enable && in.psiValid
-                   && (psiUse >= spActive - cfg.sleepBand)
-                   && (hzCmd <= cfg.sleepHz + cfg.sleepHz2)
-                   && flowIdle;
+    bool g1spEff = spEff  >= sp - 0.1f;
+    bool g1psi   = psiUse >= sp - cfg.sleepBand;
+    bool g1hz    = hzCmd  <= thr1;
+    bool sleepP1 = in.enable && in.psiValid && g1spEff && g1psi && g1hz && flowIdle;
+
+    bool g2psi   = psiUse >= spActive - cfg.sleepBand;
+    bool g2hz    = hzCmd  <= thr2;
+    bool sleepP2 = in.enable && in.psiValid && g2psi && g2hz && flowIdle;
 
     bool wake = (psiUse <= sp - cfg.wakeDrop)
                 || (in.flowValid && in.flowGPM > cfg.wakeGPM);
@@ -244,10 +278,16 @@ public:
     } else if (sleepStage == 2) {
       hzCmd = 0.0f; pidI = shutoffHz; tPid = 0;   // wake from roughly the right speed
     } else {
+      // Easing into the charge on its own ramp keeps the boost from arriving as
+      // a step on the speed command.
+      float rampPsiS = cfg.spRampPsiS;
+      if (sleepStage == 1 && cfg.chargeRampS > 0.05f && cfg.sleepBoost > 0.01f)
+        rampPsiS = cfg.sleepBoost / cfg.chargeRampS;
+
       tPid += dt;
       while (tPid >= 0.05f) {
         tPid -= 0.05f;
-        if (spEff < spActive) spEff = fminf(spActive, spEff + cfg.spRampPsiS * 0.05f);
+        if (spEff < spActive) spEff = fminf(spActive, spEff + rampPsiS * 0.05f);
         else                  spEff = spActive;  // setpoint lowered, or charge abandoned
 
         float err  = spEff - psiUse;
@@ -259,6 +299,8 @@ public:
         // straight out of the integrator, so the loop leaves a limit the
         // moment the error reverses instead of unwinding for ten seconds first
         pidI += (hzCmd - raw);
+
+        d.err = err; d.pTerm = cfg.kp * err; d.raw = raw; d.clamp = hzCmd - raw;
       }
     }
 
@@ -294,6 +336,21 @@ public:
     else if (spEff < sp - 0.1f)                           out.state = STATE_FILL;
     else if (hzCmd >= capHz - 0.2f && capHz < cfg.maxHz)  out.state = STATE_CAPPED;
     else                                                  out.state = STATE_REGULATE;
+
+    // ------------------------------------------------------- diagnostics only
+    d.sp = sp; d.spActive = spActive; d.spEff = spEff; d.psiUse = psiUse;
+    d.iTerm = pidI; d.floorEff = floorEff; d.psiFilt = psiFilt;
+    d.shutoffSP = shutoffHz; d.shutoffActive = shutoffActive;
+    d.thr1 = thr1; d.thr2 = thr2;
+    d.iAtFloor = (pidI <= floorEff + 0.05f);
+    d.iAtCap   = (pidI >= fminf(capHz, cfg.maxHz) - 0.05f);
+    d.flowIdle = flowIdle; d.wake = wake;
+    d.g1spEff = g1spEff; d.g1psi = g1psi; d.g1hz = g1hz;
+    d.g2psi = g2psi; d.g2hz = g2hz;
+    d.tP1 = tSleepP1.acc; d.tP2 = tSleepP2.acc;
+    d.tMin = tSleepMin.acc; d.tBst = tBoost.acc;
+    d.tUp = tStageUp.acc; d.tDn = tStageDn.acc; d.tLag = tLagRun.acc;
+    d.stageUp = stageUp; d.stageDown = stageDown; d.lagOn = lagOn;
   }
 
 private:

@@ -32,6 +32,10 @@ the serial banner, the page header, and `/status`.
   hard cap is fine; a filter inserts phase lag into someone else's control loop.
 - **Measurements pass through verbatim.** Never report a corrected or invented
   value as if it were measured — it destroys the operator's ability to diagnose.
+- **The web page lives in `page.h`, never in the `.ino`.** Arduino generates C++
+  prototypes by scanning `.ino` files and does not understand raw string literals,
+  so a line like `function foo(){` inside `R"HTML(...)HTML"` breaks the build with
+  *"'function' does not name a type"*. `.h` files are not preprocessed.
 
 ## Build environment
 

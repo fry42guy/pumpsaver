@@ -79,6 +79,7 @@ the drive stops on its own. Confirm it is set.
 | `pumpsaver.ino` | I/O, Modbus master, web UI, main tick |
 | `pump_control.h` | the control block — pure, no Arduino deps, desktop-compilable |
 | `plant_sim.h` | bench plant model |
+| `page.h` | the web UI, kept out of the .ino for a build reason (see DESIGN_NOTES) |
 | `test/harness.cpp` | desktop co-simulation — runs the real control block with no board |
 | `DESIGN_NOTES.md` | decisions and why, open questions |
 | `ROADMAP.md` | phases and goal tracking |
