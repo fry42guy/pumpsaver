@@ -48,10 +48,18 @@ h3{font-size:11px;margin:10px 0 3px;color:#888;text-transform:uppercase;letter-s
 .bar{height:3px;background:#e4e4e4;border-radius:2px;overflow:hidden;margin-top:2px}
 .bar i{display:block;height:100%;background:#1f6f8b}
 pre{background:#eceeea;padding:8px;font-size:12px;white-space:pre-wrap;margin:8px 0 0}
+.bub{display:flex;gap:16px;align-items:center;flex-wrap:wrap;background:#fff;border-radius:6px;padding:9px 12px;margin-bottom:8px;font-size:13px}
+.bub>span.lbl{color:#666;font-size:10px;letter-spacing:.06em;text-transform:uppercase}
+.bub .d{display:flex;gap:6px;align-items:center}
+.dot{width:13px;height:13px;border-radius:50%;background:#c9ccc7;box-shadow:inset 0 0 0 1px rgba(0,0,0,.18);flex:none}
+.dot.g{background:#1d7a4c}.dot.r{background:#b4531a}
+.ovrb{background:#8a1c1c;color:#fff;padding:9px 18px;font-weight:700;font-size:13px;letter-spacing:.03em}
 </style></head><body>
 <header>PumpSaver <span id="ver" style="float:right;font-weight:400;font-size:12px;opacity:.8"></span></header>
 <div class="sim" id="simbar" style="display:none">SIMULATION - NOT CONTROLLING REAL HARDWARE</div>
+<div class="ovrb" id="ovrbar" style="display:none">MAX-Hz OVERRIDE ENGAGED - CAVITATION CAP BYPASSED</div>
 <main>
+<div class="bub" id="bub"><span class="lbl">Drives</span></div>
 <div class="tiles">
 <div class="t"><small>Pressure</small><b id="psi">--</b></div>
 <div class="t"><small>Setpoint</small><b id="spa">--</b></div>
@@ -77,6 +85,14 @@ pre{background:#eceeea;padding:8px;font-size:12px;white-space:pre-wrap;margin:8p
 <button class="red" onclick="sendCmd('stop')">Stop</button>
 <button class="grey" onclick="sendCmd('reset')">Fault reset</button>
 <button class="grey" onclick="sendCmd('scan')">Rescan drives</button>
+<div class="sl" style="margin-top:14px"><span>Max Hz override</span>
+<input type="range" id="ovs" min="0" max="100" step="1" value="100">
+<input type="number" id="ovsv" min="0" max="100" step="1" value="100"></div>
+<div class="rng" style="gap:8px">
+<input type="checkbox" id="ovon" style="width:auto;margin:0">
+<span style="color:#333;font-size:12px">engage override</span>
+<span id="ovhz" style="margin-left:6px"></span></div>
+<div class="hint">Diagnostic only. While engaged this <b>replaces</b> the cavitation cap and the Max&nbsp;Hz setting &mdash; 100&nbsp;% = 60&nbsp;Hz, 0&nbsp;% = stopped &mdash; and the minimum-speed floor drops to 0, so the pump can be walked all the way down. Sleep is suspended. Never saved: a reboot always comes back with the cap enforcing.</div>
 </section>
 
 <section><h2>Diagnostics</h2>
@@ -86,6 +102,44 @@ pre{background:#eceeea;padding:8px;font-size:12px;white-space:pre-wrap;margin:8p
 <section><h2>Drives</h2>
 <table><thead><tr><th>#</th><th>Addr</th><th>Comms</th><th>Hz</th><th>A</th><th>State</th></tr></thead>
 <tbody id="drv"></tbody></table>
+</section>
+<section><h2>Drive setup (E3 keypad)</h2>
+<div class="hint" style="margin:0 0 8px">What a drive needs before it will answer this board. Do it once per
+drive, from the front keypad, with the motor stopped. Unlock with <b>P-14 = 101</b> first &mdash; nothing past
+P-14 is visible until you do.</div>
+<details><summary style="cursor:pointer;font-size:14px;font-weight:600">1. Factory reset (optional, but the clean start)</summary>
+<div class="hint" style="margin:6px 0 4px;font-size:12px">
+Drive stopped. Press and hold <b>UP + DOWN + STOP</b> together for about 2 s until the display shows
+<b>P-dEF</b>, then press <b>STOP</b> to confirm. Every parameter is back to default: Modbus address 1,
+115.2 kbaud, watchdog off, terminal control (P-12 = 0). A fresh drive from the box is already in this state.
+Motor data is wiped too, so re-enter it in step 3.</div></details>
+<details open><summary style="cursor:pointer;font-size:14px;font-weight:600">2. Comms parameters &mdash; the ones that make it talk</summary>
+<table style="margin-top:6px"><thead><tr><th>Param</th><th>Set to</th><th>Why</th></tr></thead><tbody>
+<tr><td>P-14</td><td>101</td><td>Unlocks the extended parameters below</td></tr>
+<tr><td>P-12</td><td>3</td><td>Modbus RTU control &mdash; run/stop and speed come from this board</td></tr>
+<tr><td>P-36 &middot; 1st field</td><td>2 (next drive 3, then 4, 5)</td><td>Modbus address. <b>Never leave a drive at 1</b> &mdash; 1 is the uncommissioned slot; this board warns about it but will not run it</td></tr>
+<tr><td>P-36 &middot; 2nd field</td><td>115.2</td><td>kbaud &mdash; must match this board (it is the drive default)</td></tr>
+<tr><td>P-36 &middot; 3rd field</td><td>t 1000</td><td>Comms watchdog: drive trips itself after 1 s of silence. Not optional &mdash; it is what stops the pump if this board dies</td></tr>
+<tr><td>P-31</td><td>0</td><td>Start only on a command from this board; never auto-run at power-up</td></tr>
+<tr><td>P-16</td><td>t 4-20</td><td>Transducer on analog input 1 as 4&ndash;20 mA, trip on a broken loop</td></tr>
+</tbody></table>
+<div class="hint" style="margin:6px 0 0;font-size:12px">P-36 is one parameter with three fields: the Navigate key steps from address to baud to watchdog.
+The hardware enable (terminal 1&ndash;2 link) must be closed or the drive shows a stop regardless of what Modbus says.
+Set the address <i>last</i> &mdash; once it changes, the drive stops answering at 1 and shows up under Drives on the next rescan.</div></details>
+<details><summary style="cursor:pointer;font-size:14px;font-weight:600">3. Motor data &mdash; the overload protection</summary>
+<div class="hint" style="margin:6px 0 4px;font-size:12px">From the motor nameplate, not the drive rating: <b>P-07</b> rated volts,
+<b>P-08</b> rated amps (FLA &mdash; a 5 HP drive left at its own rating will not protect a 5.9 A motor),
+<b>P-09</b> rated Hz, <b>P-10</b> rated rpm. Then P-01 max Hz if the skid has a ceiling below 60.</div></details>
+<details><summary style="cursor:pointer;font-size:14px;font-weight:600">4. Wiring &amp; what the scan results mean</summary>
+<div class="hint" style="margin:6px 0 4px;font-size:12px">
+Cat5e from the drive's front RJ45 to this board: pins <b>7 / 8</b> are the Modbus A / B pair; +24 V and 0 V ride on the same cable.
+Power the drive <b>first</b> &mdash; it boots slower than this board, so a scan at the same instant finds nothing. Then press <i>Rescan drives</i>.<br><br>
+<b>no drives found</b> &mdash; nothing answered. Drive off or still booting, cable in the wrong RJ45 (the RS-485 pair is on the front port, not the PC port),
+P-12 not 3, or A/B open.<br>
+<b>CRC errors -- bus wiring suspect</b> &mdash; something is on the wire but frames are garbled. Almost always A and B swapped; otherwise a baud mismatch in P-36, or
+termination missing/doubled (120 &Omega; on this board's RS-485 jumper, none at the drive).<br>
+<b>uncommissioned drive answering at address 1</b> &mdash; wiring and baud are proven good. Set P-36 address to 2 (or the next free number) and rescan.<br>
+<b>Drive shows SC-trP</b> &mdash; its comms watchdog tripped: it was talking and then heard nothing for the P-36 timeout. Check this board is up, then <i>Fault reset</i>.</div></details>
 </section>
 
 <section id="simsec" style="display:none"><h2>Simulated plant</h2>
@@ -340,6 +394,19 @@ let r='';for(const d of j.drives){r+='<tr><td>'+d.n+'</td><td>'+d.addr+'</td><td
  (d.present?(d.commsOK?'ok':'LOST'):'-')+'</td><td>'+d.hz.toFixed(1)+'</td><td>'+
  d.amps.toFixed(1)+'</td><td>'+(d.tripped?('TRIP '+d.tripCode):(d.running?'run':'stop'))+
  '</td></tr>';}drv.innerHTML=r;
+// connection bubbles: green only when the drive both answers reads AND takes
+// writes, because a drive that reads but refuses writes is not a working link
+let b='<span class="lbl">Drives</span>';
+for(const d of j.drives){
+ const cls=d.present?((d.commsOK&&d.writeOK)?'g':'r'):'';
+ const txt=d.present?(d.commsOK?(d.writeOK?'ok':'no write'):'LOST'):'absent';
+ b+='<span class="d"><i class="dot '+cls+'"></i>'+d.n+' @'+d.addr+' &middot; '+txt+'</span>';}
+bub.innerHTML=b;
+ovrbar.style.display=j.ovr?'block':'none';
+ovon.checked=j.ovr;
+if(document.activeElement!==ovs&&document.activeElement!==ovsv){
+ ovs.value=j.ovrPct;ovsv.value=j.ovrPct;}
+ovhz.textContent=(ovs.value*0.6).toFixed(1)+' Hz';
 let s=j.enable?'Enabled':'Disabled';
 if(!j.psiValid)s='PRESSURE INVALID - pumps held';
 else if(j.addr1)s+=' - uncommissioned drive at address 1';
@@ -522,6 +589,18 @@ async function save(){const d=new URLSearchParams(new FormData(f));
 log.textContent=await(await fetch('/set',{method:'POST',body:d})).text();
 trail=[];await loadS();return false;}
 async function sendCmd(c){log.textContent=await(await fetch('/cmd?c='+c,{method:'POST'})).text();}
+// ---- max-Hz override ----------------------------------------------------
+// Applied on release, not while dragging: this commands a real pump, and
+// sweeping it through every intermediate speed on the way to the one you
+// wanted is not something a diagnostic tool should do behind your back.
+async function pushOvr(){const d=new URLSearchParams();
+ d.set('on',ovon.checked?'1':'0');d.set('pct',ovs.value);
+ await fetch('/ovr',{method:'POST',body:d});}
+ovs.addEventListener('input',()=>{ovsv.value=ovs.value;
+ ovhz.textContent=(ovs.value*0.6).toFixed(1)+' Hz';});
+ovs.addEventListener('change',pushOvr);
+ovsv.addEventListener('change',()=>{ovs.value=ovsv.value;pushOvr();});
+ovon.addEventListener('change',pushOvr);
 loadS();loadNet();loadCan();tick();setInterval(tick,1000);
 setInterval(loadNet,5000);setInterval(loadCan,2000);
 </script></body></html>)HTML";

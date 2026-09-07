@@ -19,8 +19,8 @@
 
 param([switch]$Upload, [switch]$Clean, [string]$Port = "COM5")
 
-$cli = "C:\Program Files\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe"
-$cfg = "C:\Users\RyanBaird\.arduinoIDE\arduino-cli.yaml"
+$cli = "$env:LOCALAPPDATA\Programs\arduino-ide\resources\app\lib\backend\resources\arduino-cli.exe"
+$cfg = "$env:USERPROFILE\.arduinoIDE\arduino-cli.yaml"
 $fqbn = "esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PSRAM=opi"
 $sketch = $PSScriptRoot
 $bp = "$env:LOCALAPPDATA\Temp\pumpsaver-build"

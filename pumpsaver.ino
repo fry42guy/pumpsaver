@@ -27,20 +27,22 @@
 #include "pump_control.h"
 #include "plant_sim.h"
 
-// net.h needs the version string at runtime; the macro is not visible to it.
-const char *FW_VERSION_STR = FW_VERSION;
-#include "net.h"
-
 // ---------------------------------------------------------------- version
 // Bump FW_VERSION on every change pass before flashing.  The number is shown
 // on the serial banner, in the page header and in /status, so a board in the
 // field can always be matched to a commit.  See VERSION.md for the log.
-#define FW_VERSION "0.8.0"
+// This block must stay ABOVE FW_VERSION_STR below -- that initialiser expands
+// the macro, so defining it afterwards does not compile.
+#define FW_VERSION "0.9.0"
+
+// net.h needs the version string at runtime; the macro is not visible to it.
+const char *FW_VERSION_STR = FW_VERSION;
+#include "net.h"
 
 // ---------------------------------------------------------------- build mode
 // 1 = simulated plant, no drive or RS485 needed.  0 = real drives over Modbus.
 // The web page shows an unmissable banner while this is 1.
-#define SIM 1
+#define SIM 0
 
 #define AP_SSID        "FCW-PUMP"
 #define AP_PASS        "fullcircle"
@@ -153,6 +155,13 @@ struct Drive {
   float    hz = 0, amps = 0;
   bool     running = false, tripped = false, ready = false;
   uint8_t  tripCode = 0;
+  // Writes are tracked separately from reads.  "The drive answers a read" and
+  // "the drive accepts a write" are different questions -- a wrong P-12, a
+  // write-protected parameter set or a read-only slave answers one and not the
+  // other -- and a discarded write result makes a dead command path look
+  // exactly like a working one.
+  bool     writeOK = false;
+  uint32_t writeFails = 0;
 };
 Drive drv[MAX_DRIVES];
 bool  addr1Occupied = false;     // an uncommissioned drive is sitting at 1
@@ -192,6 +201,12 @@ PlantSim    plant;
 
 bool     gEnable  = false;       // NOT persisted -- a power cut must not restart the pump
 bool     gLockout = false;       // local inhibit, survives nothing either
+
+// Diagnostic max-Hz override.  NOT persisted, for the same reason gEnable is
+// not: it replaces the cavitation cap, so a reboot has to come back with the
+// cap enforcing again rather than silently still overridden.
+bool     gOvr     = false;
+float    gOvrPct  = 100.0f;      // 0-100 %, of 60 Hz
 uint32_t gCmdReset = 0;
 uint32_t lastTick = 0, tickN = 0;
 float    gPsiRaw = 0;
@@ -286,7 +301,11 @@ void commandDrive(Drive &d, bool run, float hz, bool reset) {
   uint16_t w[2];
   w[0] = (run ? 1 : 0) | (reset ? 4 : 0);
   w[1] = (uint16_t)(limitf(0, hz, 60.0f) * 10.0f + 0.5f);
-  rtu.writeMultiple(d.addr, REG(1), w, 2);
+  bool ok = rtu.writeMultiple(d.addr, REG(1), w, 2);
+  if (ok != d.writeOK)
+    Serial.printf("drive at %u: writes %s\n", d.addr, ok ? "OK" : "FAILING");
+  d.writeOK = ok;
+  if (!ok) d.writeFails++;
 }
 #endif
 
@@ -304,6 +323,7 @@ String statusJSON() {
   j += ",\"spActive\":" + String(pout.spActive, 1) + ",\"hzCmd\":" + String(pout.hzCmd, 1);
   j += ",\"capHz\":" + String(pout.capHz, 1) + ",\"shutoffHz\":" + String(pout.shutoffHz, 1);
   j += ",\"state\":" + String(pout.state) + ",\"enable\":" + String(gEnable ? "true" : "false");
+  j += ",\"ovr\":" + String(gOvr ? "true" : "false") + ",\"ovrPct\":" + String(gOvrPct, 0);
   j += ",\"sleepCycles\":" + String(pc.sleepCycles);
   j += ",\"addr1\":" + String(addr1Occupied ? "true" : "false");
   j += ",\"flow\":" + String(plant.flowGPM, 1) + ",\"hzAct\":" + String(plant.hzAct, 1);
@@ -313,6 +333,8 @@ String statusJSON() {
     j += "{\"n\":" + String(i + 1) + ",\"addr\":" + String(drv[i].addr);
     j += ",\"present\":" + String(drv[i].present ? "true" : "false");
     j += ",\"commsOK\":" + String(drv[i].commsOK ? "true" : "false");
+    j += ",\"writeOK\":" + String(drv[i].writeOK ? "true" : "false");
+    j += ",\"writeFails\":" + String(drv[i].writeFails);
     j += ",\"hz\":" + String(drv[i].hz, 1) + ",\"amps\":" + String(drv[i].amps, 1);
     j += ",\"running\":" + String(drv[i].running ? "true" : "false");
     j += ",\"tripped\":" + String(drv[i].tripped ? "true" : "false");
@@ -507,6 +529,17 @@ void setupWeb() {
     else r->send(400, "text/plain", "unknown cmd");
   });
 
+  // Diagnostic max-Hz override.  Nothing here is written to NVS -- see gOvr.
+  server.on("/ovr", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (r->hasParam("on", true))
+      gOvr = r->getParam("on", true)->value() == "1";
+    if (r->hasParam("pct", true))
+      gOvrPct = limitf(0, r->getParam("pct", true)->value().toFloat(), 100);
+    r->send(200, "application/json",
+            String("{\"ovr\":") + (gOvr ? "true" : "false") +
+            ",\"ovrPct\":" + String(gOvrPct, 0) + "}");
+  });
+
   server.onNotFound([](AsyncWebServerRequest *r) { r->redirect("http://192.168.4.1/"); });
   // ---- network -------------------------------------------------------
   server.on("/net", HTTP_GET, [](AsyncWebServerRequest *r) {
@@ -634,7 +667,8 @@ void setup() {
 
   Serial.println("PumpSaver firmware " FW_VERSION);
   Serial.printf("AP %s up at %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
-  Serial.println("t_ms,psi,spAct,hzCmd,cap,shutoff,flow,state,lead,lag,sleep");
+  Serial.println("t_ms,psi,spAct,hzCmd,cap,shutoff,flow,state,lead,lag,sleep,"
+                 "d1Hz,d1A,d1st,d1rd,d1wr,d2Hz,d2A,d2st,d2rd,d2wr");
 }
 
 void loop() {
@@ -655,6 +689,8 @@ void loop() {
   pin_.enable    = gEnable && !gLockout;
   pin_.setpoint  = S.setpoint;
   pin_.flowValid = S.useFlow;
+  pin_.ovrActive = gOvr;
+  pin_.ovrHz     = gOvrPct * 0.6f;        // 100 % = 60 Hz
   pin_.lagAvail  = drv[1].present && (SIM || (drv[1].commsOK && !drv[1].tripped));
   bool reset = (gCmdReset && now - gCmdReset < 1000);
 
@@ -686,6 +722,7 @@ void loop() {
   drv[0].amps = pout.runLead ? plant.amps : 0;
   drv[1].amps = pout.runLag  ? plant.amps : 0;
   drv[0].commsOK = drv[1].commsOK = true;
+  drv[0].writeOK = drv[1].writeOK = true;   // nothing is written in a sim build
 #else
   uint16_t ai = 0;
   Drive &src = drv[0];                       // transducer lives on the lead drive
@@ -711,9 +748,15 @@ void loop() {
 #endif
 
   // ---- 4. CSV for the bench
-  Serial.printf("%lu,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%s,%d,%d,%d\n",
+  // The per-drive tail is the raw Modbus evidence: what came back from regs
+  // 6/7/8 (status, Hz, A) and whether the last read and the last command write
+  // were acknowledged.  On the bench this is the whole point of the log.
+  Serial.printf("%lu,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%s,%d,%d,%d,"
+                "%.1f,%.1f,0x%04X,%d,%d,%.1f,%.1f,0x%04X,%d,%d\n",
     now, pin_.psi, pout.spActive, pout.hzCmd, pout.capHz, pout.shutoffHz,
-    plant.flowGPM, stateName(pout.state), pout.runLead, pout.runLag, pc.sleepStage);
+    plant.flowGPM, stateName(pout.state), pout.runLead, pout.runLag, pc.sleepStage,
+    drv[0].hz, drv[0].amps, drv[0].status, drv[0].commsOK, drv[0].writeOK,
+    drv[1].hz, drv[1].amps, drv[1].status, drv[1].commsOK, drv[1].writeOK);
 
   // ---- 5. hand a snapshot to the net task.  Copy only; it publishes on its
   //         own schedule and on its own core, so nothing here can block.

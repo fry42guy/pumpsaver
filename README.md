@@ -72,7 +72,7 @@ The serial CSV is one line per 100 ms tick:
 
 ## Going to real hardware
 
-Set `#define SIM 0`. Then on each drive, from the keypad:
+Set `#define SIM 0`. Then on each drive, from the keypad (the **Drive setup** card on the web page walks through this, including the factory reset):
 
 `P-14 = 101` · `P-12 = 3` · `P-31 = 0 or 1` · `P-36`: address, 115.2 kbaud, 1000 ms
 watchdog · `P-16 = t 4-20` · motor data `P-07..P-10`, `P-54`

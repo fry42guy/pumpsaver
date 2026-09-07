@@ -117,6 +117,17 @@ struct PumpIn {
   float flowGPM   = 0;      // 0 if not metered
   bool  flowValid = false;  // true only when a flow meter is fitted
   bool  lagAvail  = false;  // second pump healthy and available to stage
+
+  /* Diagnostic max-Hz override.  When ovrActive, ovrHz REPLACES the cavitation
+     cap and cfg.maxHz as the ceiling, and the minimum-speed floor drops to 0 so
+     the pump can be walked all the way down.  This deliberately allows running
+     past the cavitation limit -- it is a bench and commissioning tool, not a
+     control feature.  It lives in PumpIn, not PumpCfg, precisely so it cannot
+     be persisted: like `enable`, it is fed in fresh every tick and a reboot
+     always comes back with the cap doing its job.  Sleep is suspended while it
+     is active so what you dial in is what the pump runs. */
+  bool  ovrActive = false;
+  float ovrHz     = 60.0f;
 };
 
 struct PumpOut {
@@ -213,7 +224,16 @@ public:
       else                capHz = fminf(target, capHz + 0.3f);
       capHz = limitf(cfg.capHzPt[0], capHz, cfg.maxHz);
     }
+    // The one place the speed limits are decided, so the PI clamp, the output
+    // clamp and anti-windup can never disagree about what the ceiling is.
+    // capHz itself is left alone: it is reported to the HMI as the real
+    // cavitation cap whether or not the override is standing on top of it.
     float floorEff = fminf(cfg.minHz, capHz);
+    float hiEff    = fminf(capHz, cfg.maxHz);
+    if (in.ovrActive) {
+      hiEff    = limitf(0.0f, in.ovrHz, 60.0f);
+      floorEff = 0.0f;
+    }
 
     // ------------------------------------------------------------ 3. SLEEP
     // Thresholds measured from the shutoff speed track the setpoint; phase 2
@@ -226,11 +246,15 @@ public:
     bool g1spEff = spEff  >= sp - 0.1f;
     bool g1psi   = psiUse >= sp - cfg.sleepBand;
     bool g1hz    = hzCmd  <= thr1;
-    bool sleepP1 = in.enable && in.psiValid && g1spEff && g1psi && g1hz && flowIdle;
+    // Sleep is suspended under the override: the gates key off hzCmd, and a
+    // hand-dialled speed would otherwise trip them and put the pump to sleep
+    // in the middle of a diagnostic run.
+    bool sleepP1 = in.enable && in.psiValid && !in.ovrActive
+                   && g1spEff && g1psi && g1hz && flowIdle;
 
     bool g2psi   = psiUse >= spActive - cfg.sleepBand;
     bool g2hz    = hzCmd  <= thr2;
-    bool sleepP2 = in.enable && in.psiValid && g2psi && g2hz && flowIdle;
+    bool sleepP2 = in.enable && in.psiValid && !in.ovrActive && g2psi && g2hz && flowIdle;
 
     bool wake = (psiUse <= sp - cfg.wakeDrop)
                 || (in.flowValid && in.flowGPM > cfg.wakeGPM);
@@ -293,7 +317,7 @@ public:
         float err  = spEff - psiUse;
         pidI      += cfg.ki * err * 0.05f;
         float raw  = pidI + cfg.kp * err;
-        hzCmd      = limitf(floorEff, raw, fminf(capHz, cfg.maxHz));
+        hzCmd      = limitf(floorEff, raw, hiEff);
 
         // anti-windup by back-calculation: whatever the clamp took away comes
         // straight out of the integrator, so the loop leaves a limit the
@@ -320,12 +344,15 @@ public:
     if (!in.enable || !in.lagAvail) lagOn = false;
 
     // ----------------------------------------------------------- 6. OUTPUTS
-    hzCmd = limitf(0.0f, hzCmd, cfg.maxHz);
+    hzCmd = limitf(0.0f, hzCmd, in.ovrActive ? hiEff : cfg.maxHz);
     out.hzCmd     = hzCmd;
     out.capHz     = capHz;
     out.shutoffHz = shutoffHz;
     out.spActive  = spActive;
-    out.runLead   = in.enable && in.psiValid && (sleepStage != 2);
+    // An override of 0 Hz means stopped, not "running at zero speed" -- leaving
+    // the run bit set would hold the drive energised against a 0 reference.
+    out.runLead   = in.enable && in.psiValid && (sleepStage != 2)
+                    && !(in.ovrActive && hiEff <= 0.0f);
     out.runLag    = out.runLead && lagOn;
 
     if      (!in.psiValid)                                out.state = STATE_FAULT;
