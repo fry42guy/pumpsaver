@@ -27,6 +27,7 @@
 */
 
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
 
@@ -42,6 +43,25 @@ struct NetCfg {
   char     mpass[65] = "";
   char     topic[40] = "fcw/pumpsaver";
   uint16_t pubMs     = 5000;
+
+  /* ---- appended in 0.10.0 -------------------------------------------------
+     APPEND ONLY, and do not reorder what is above.  The blob is a raw byte
+     copy, and Preferences::getBytes fills only as many bytes as were stored,
+     leaving the rest at the defaults written here.  So new fields at the END
+     read as their defaults on a board that was configured by an older build,
+     and the magic does not have to change -- which means nobody has to retype
+     an SSID to take this update.  Insert a field in the middle instead and
+     every value after it is silently garbage.                              */
+  bool     useStatic = false;          // false = DHCP
+  uint8_t  ip[4]     = {0, 0, 0, 0};   // no opinionated default: a guessed
+  uint8_t  gw[4]     = {0, 0, 0, 0};   // subnet that half-matches the site
+  uint8_t  mask[4]   = {255, 255, 255, 0};  // is worse than an empty box
+  uint8_t  dns[4]    = {0, 0, 0, 0};
+
+  char     apSsid[33] = "FCW-PUMP";    // was compiled in before 0.10.0
+  char     apPass[65] = "fullcircle";
+  char     host_name[24] = "pumpsaver";     // mDNS: pumpsaver.local
+  char     label[24]     = "";              // free text, shown in the header
 };
 
 // ---------------------------------------------------------------- telemetry
@@ -75,6 +95,61 @@ static char     gDevId[16]   = "";
 static uint32_t gMqttFails   = 0;
 static uint32_t gLastPubMs   = 0;
 static String   gNetLog      = "";
+static bool     gMdnsUp      = false;
+
+// ---------------------------------------------------------------- addresses
+static String netQuad(const uint8_t *a) {
+  return String(a[0]) + "." + String(a[1]) + "." + String(a[2]) + "." + String(a[3]);
+}
+
+// Leaves the target untouched unless all four octets parse and are in range.
+// A half-applied address is worse than the old one, and "10.79.262.4" must be
+// refused rather than truncated into something that looks plausible.
+static bool netParseQuad(const String &s, uint8_t *out) {
+  int v[4];
+  if (sscanf(s.c_str(), "%d.%d.%d.%d", &v[0], &v[1], &v[2], &v[3]) != 4) return false;
+  for (int i = 0; i < 4; i++) if (v[i] < 0 || v[i] > 255) return false;
+  for (int i = 0; i < 4; i++) out[i] = (uint8_t)v[i];
+  return true;
+}
+
+// mDNS labels are hostnames: fold to [a-z0-9-] or it resolves for nobody.
+static String netSanitizeHost(const String &in) {
+  String o;
+  for (size_t i = 0; i < in.length() && o.length() < 22; i++) {
+    char c = in[i];
+    if (c >= 'A' && c <= 'Z') c += 32;
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) o += c;
+    else if ((c == '-' || c == ' ' || c == '_') && o.length() && o[o.length() - 1] != '-') o += '-';
+  }
+  while (o.length() && o[o.length() - 1] == '-') o.remove(o.length() - 1);
+  return o.length() ? o : String("pumpsaver");
+}
+
+static void netStartMdns() {
+  if (gMdnsUp) MDNS.end();
+  gMdnsUp = MDNS.begin(gNet.host_name);
+  if (!gMdnsUp) return;
+  MDNS.addService("http", "tcp", 80);
+  // Advertised so a future hub can enumerate units without a hard-coded
+  // address list.  The casts are required -- these are char[], which makes
+  // the char* and const char* overloads equally good matches.
+  MDNS.addServiceTxt("http", "tcp", "unit",  (const char *)gDevId);
+  MDNS.addServiceTxt("http", "tcp", "label", (const char *)gNet.label);
+}
+
+// Static addressing is applied on the net task, never from a web handler --
+// same rule as WiFi.begin().  All-zero address means "not configured", which
+// falls back to DHCP rather than trying to claim 0.0.0.0.
+static void netApplyIp() {
+  if (gNet.useStatic && (gNet.ip[0] || gNet.ip[1] || gNet.ip[2] || gNet.ip[3])) {
+    IPAddress ip(gNet.ip), gw(gNet.gw), mask(gNet.mask), dns(gNet.dns);
+    if (!WiFi.config(ip, gw, mask, dns))
+      gNetLog = "Static IP rejected -- falling back to DHCP.";
+  } else {
+    WiFi.config(IPAddress((uint32_t)0), IPAddress((uint32_t)0), IPAddress((uint32_t)0));
+  }
+}
 
 // ---------------------------------------------------------------- helpers
 static void netDeviceId() {
@@ -127,6 +202,21 @@ String netStatusJSON() {
   j += ",\"user\":\"" + String(gNet.user) + "\"";
   j += ",\"topic\":\"" + String(gNet.topic) + "\"";
   j += ",\"pubMs\":" + String(gNet.pubMs);
+  j += ",\"useStatic\":" + String(gNet.useStatic ? "true" : "false");
+  j += ",\"sip\":\""  + netQuad(gNet.ip)   + "\"";
+  j += ",\"gw\":\""   + netQuad(gNet.gw)   + "\"";
+  j += ",\"mask\":\"" + netQuad(gNet.mask) + "\"";
+  j += ",\"dns\":\""  + netQuad(gNet.dns)  + "\"";
+  j += ",\"apSsid\":\"" + String(gNet.apSsid) + "\"";
+  j += ",\"apClients\":" + String(WiFi.softAPgetStationNum());
+  j += ",\"hostName\":\"" + String(gNet.host_name) + "\"";
+  j += ",\"mdns\":\"" + String(gNet.host_name) + ".local\"";
+  j += ",\"mdnsUp\":" + String(gMdnsUp ? "true" : "false");
+  j += ",\"label\":\"" + String(gNet.label) + "\"";
+  j += ",\"mac\":\"" + WiFi.macAddress() + "\"";
+  j += ",\"ch\":" + String(WiFi.channel());
+  j += ",\"passSet\":"  + String(gNet.pass[0]  ? "true" : "false");
+  j += ",\"mpassSet\":" + String(gNet.mpass[0] ? "true" : "false");
   j += ",\"log\":\"" + gNetLog + "\"";
   j += "}";                                  // passwords are never sent out
   return j;
@@ -180,6 +270,7 @@ static void netPublish() {
 // ---------------------------------------------------------------- the task
 static void netTask(void *) {
   uint32_t nextWifiTry = 0, nextMqttTry = 0;
+  bool     staWasUp = false;
 
   for (;;) {
     uint32_t now = millis();
@@ -190,13 +281,20 @@ static void netTask(void *) {
       gNet = gNetPending;
       netSave();
       WiFi.disconnect(false, false);
+      netApplyIp();                       // must precede begin() to take effect
       if (gNet.ssid[0]) WiFi.begin(gNet.ssid, gNet.pass);
       if (gMqtt.connected()) gMqtt.disconnect();
       gMqttFails = 0;
       nextWifiTry = now + 8000;
       nextMqttTry = 0;
+      netStartMdns();                     // the host name may have changed
       gNetLog = "Network settings applied.";
     }
+
+    // mDNS binds to an interface, so it has to be restarted once the station
+    // actually has an address -- otherwise the name only answers on the AP.
+    bool up = (WiFi.status() == WL_CONNECTED);
+    if (up != staWasUp) { staWasUp = up; if (up) netStartMdns(); }
 
     // ---- station: reconnect with a slow retry, never a blocking wait ----
     if (gNet.ssid[0] && WiFi.status() != WL_CONNECTED && now >= nextWifiTry) {
@@ -243,12 +341,25 @@ static void netTask(void *) {
 }
 
 // ---------------------------------------------------------------- api
-// Call after WiFi.mode(WIFI_AP_STA) and softAP() are up.
+// Owns radio bring-up as of 0.10.0: the AP SSID and password come out of NVS
+// now rather than being compiled in, so the .ino cannot raise the AP before
+// this has loaded the config.  Call it with the mode already set to AP_STA.
+//
+// The AP always comes up, even with a station configured.  A wrong SSID must
+// never strand a board -- the same reasoning that keeps gEnable out of NVS.
+// One radio means the softAP is dragged onto the station's channel when it
+// associates, so AP clients get bumped once and reconnect.  Expected.
 void netBegin() {
   netDeviceId();
   netLoad();
+
+  WiFi.softAP(gNet.apSsid, strlen(gNet.apPass) >= 8 ? gNet.apPass : nullptr);
+  gNetLog = "AP " + String(gNet.apSsid) + " at " + WiFi.softAPIP().toString();
+
+  netApplyIp();
   if (gNet.ssid[0]) WiFi.begin(gNet.ssid, gNet.pass);
   WiFi.setAutoReconnect(true);
+  netStartMdns();
   xTaskCreatePinnedToCore(netTask, "net", 6144, nullptr, 1, nullptr, 0);
 }
 

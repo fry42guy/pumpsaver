@@ -447,6 +447,19 @@ String canStatusJSON() {
   j += ",\"tempC\":"    + String(gTempC);
   j += ",\"vendor\":"   + String(gCan.vendor);
   j += ",\"product\":"  + String(gCan.product);
+  /* Every field /canset accepts has to come back out here.  These six did not,
+     so the web form rendered them EMPTY, and saving posted "" for each --
+     which argF turns into 0.  Pressing "Save gateway" therefore switched OFF
+     capEnforce and zeroed driveAddr, revision, serial and devType, while hbMs
+     and pdoMs got clamped to their minimums.  A form that cannot show what is
+     stored will overwrite it; the fix belongs on this side, not in the page. */
+  j += ",\"capEnforce\":" + String(gCan.capEnforce ? "true" : "false");
+  j += ",\"driveAddr\":"  + String(gCan.driveAddr);
+  j += ",\"hbMs\":"       + String(gCan.hbMs);
+  j += ",\"pdoMs\":"      + String(gCan.pdoMs);
+  j += ",\"revision\":"   + String(gCan.revision);
+  j += ",\"serial\":"     + String(gCan.serial);
+  j += ",\"devType\":"    + String(gCan.devType);
   j += "}";
   return j;
 }

@@ -33,7 +33,7 @@
 // field can always be matched to a commit.  See VERSION.md for the log.
 // This block must stay ABOVE FW_VERSION_STR below -- that initialiser expands
 // the macro, so defining it afterwards does not compile.
-#define FW_VERSION "0.9.0"
+#define FW_VERSION "0.10.0"
 
 // net.h needs the version string at runtime; the macro is not visible to it.
 const char *FW_VERSION_STR = FW_VERSION;
@@ -41,11 +41,34 @@ const char *FW_VERSION_STR = FW_VERSION;
 
 // ---------------------------------------------------------------- build mode
 // 1 = simulated plant, no drive or RS485 needed.  0 = real drives over Modbus.
-// The web page shows an unmissable banner while this is 1.
+// The web page shows an unmissable banner while this is 1, and /status and
+// /sys both report it, so a screenshot can never be mistaken for real data.
+//
+// Set from build.ps1 rather than by editing this line:
+//     .\build.ps1 -Sim -Upload     simulated plant, for a demo or the bench
+//     .\build.ps1 -Upload          real drives over Modbus
+// Both binaries therefore come from ONE commit, which is what makes a board in
+// the field matchable to a commit -- a hand-edited define does not.
+// build.ps1 writes sim_flag.h on every run (it is gitignored, and generated,
+// so it never disagrees with the last build).  __has_include keeps a plain
+// Arduino IDE build working when the file is not there: no file, real drives.
+//
+// Passing -DSIM=1 via --build-property compiler.cpp.extra_flags was tried and
+// does not work: it changes the core cache key in a way that drops symbols
+// from the Arduino core, and AsyncTCP then fails to link with "undefined
+// reference to micros".
+#if defined(__has_include)
+#  if __has_include("sim_flag.h")
+#    include "sim_flag.h"
+#  endif
+#endif
+#ifndef SIM
 #define SIM 0
+#endif
 
-#define AP_SSID        "FCW-PUMP"
-#define AP_PASS        "fullcircle"
+// AP SSID and password are no longer compiled in -- they live in NetCfg (net.h,
+// its own NVS namespace) so they can be changed from the Network screen without
+// a reflash. netBegin() raises the AP. Factory defaults: FCW-PUMP / fullcircle.
 #define RS485_RX       18
 #define RS485_TX       17
 #define RS485_DE       21
@@ -208,6 +231,7 @@ bool     gLockout = false;       // local inhibit, survives nothing either
 bool     gOvr     = false;
 float    gOvrPct  = 100.0f;      // 0-100 %, of 60 Hz
 uint32_t gCmdReset = 0;
+uint32_t gRebootAt = 0;          // set by /reboot; 0 = no restart pending
 uint32_t lastTick = 0, tickN = 0;
 float    gPsiRaw = 0;
 bool     gPsiValid = false;
@@ -325,6 +349,9 @@ String statusJSON() {
   j += ",\"state\":" + String(pout.state) + ",\"enable\":" + String(gEnable ? "true" : "false");
   j += ",\"ovr\":" + String(gOvr ? "true" : "false") + ",\"ovrPct\":" + String(gOvrPct, 0);
   j += ",\"sleepCycles\":" + String(pc.sleepCycles);
+  // Controller uptime, not the browser's -- a reader has to be able to tell
+  // that the board rebooted under them.  Seconds since boot.
+  j += ",\"up\":" + String(millis() / 1000UL);
   j += ",\"addr1\":" + String(addr1Occupied ? "true" : "false");
   j += ",\"flow\":" + String(plant.flowGPM, 1) + ",\"hzAct\":" + String(plant.hzAct, 1);
   j += ",\"drives\":[";
@@ -443,7 +470,10 @@ float argF(AsyncWebServerRequest *r, const char *k, float d) {
 }
 
 void setupWeb() {
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE); });
+  server.on("/",        HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_HOME); });
+  server.on("/pump",    HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_PUMP); });
+  server.on("/network", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_NET); });
+  server.on("/system",  HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_SYSTEM); });
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "application/json", statusJSON()); });
   server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "application/json", settingsJSON()); });
   server.on("/diag", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "application/json", diagJSON()); });
@@ -540,7 +570,49 @@ void setupWeb() {
             ",\"ovrPct\":" + String(gOvrPct, 0) + "}");
   });
 
-  server.onNotFound([](AsyncWebServerRequest *r) { r->redirect("http://192.168.4.1/"); });
+  // What is running, for the System screen.  Cheap enough to poll.
+  server.on("/sys", HTTP_GET, [](AsyncWebServerRequest *r) {
+    String j = "{\"ver\":\"" FW_VERSION "\",\"id\":\"" + String(gDevId) + "\"";
+    j += ",\"sim\":" + String(SIM ? "true" : "false");
+    j += ",\"up\":" + String(millis() / 1000UL);
+    j += ",\"reset\":\"" + String(esp_reset_reason() == ESP_RST_POWERON  ? "power on"
+                               : esp_reset_reason() == ESP_RST_SW        ? "software"
+                               : esp_reset_reason() == ESP_RST_PANIC     ? "panic"
+                               : esp_reset_reason() == ESP_RST_TASK_WDT  ? "task watchdog"
+                               : esp_reset_reason() == ESP_RST_INT_WDT   ? "int watchdog"
+                               : esp_reset_reason() == ESP_RST_BROWNOUT  ? "brownout"
+                                                                        : "other") + "\"";
+    j += ",\"heap\":" + String(ESP.getFreeHeap());
+    j += ",\"psram\":" + String(ESP.getFreePsram());
+    j += ",\"sketch\":" + String(ESP.getSketchSize());
+    j += ",\"appSpace\":" + String(ESP.getSketchSize() + ESP.getFreeSketchSpace());
+    j += ",\"flash\":" + String(ESP.getFlashChipSize());
+    j += ",\"mhz\":" + String(getCpuFrequencyMhz());
+    j += "}";
+    r->send(200, "application/json", j);
+  });
+
+  // Restart, requested from the Network screen after an AP change.  The flag
+  // is consumed in loop() so the response is on the wire before the radio
+  // drops -- restarting inside the handler gives the browser a dead socket.
+  server.on("/reboot", HTTP_POST, [](AsyncWebServerRequest *r) {
+    gRebootAt = millis() + 800;
+    r->send(200, "text/plain", "Rebooting.");
+  });
+
+  // Captive-portal catch-all, but ONLY for requests that arrived on the AP.
+  // Bouncing everything to the softAP address was fine when that was the only
+  // way in; now that the board is also a station, it would send a mistyped URL
+  // on the site network to 192.168.4.1, which is unreachable from there.  On
+  // the AP an absolute URL is still required, because the OS connectivity
+  // check asks for a URL on somebody else's host.
+  server.onNotFound([](AsyncWebServerRequest *r) {
+    IPAddress ap = WiFi.softAPIP();
+    if (ap != IPAddress((uint32_t)0) && r->client()->localIP() == ap)
+      r->redirect("http://" + ap.toString() + "/");
+    else
+      r->send(404, "text/plain", "not found");
+  });
   // ---- network -------------------------------------------------------
   server.on("/net", HTTP_GET, [](AsyncWebServerRequest *r) {
     r->send(200, "application/json", netStatusJSON());
@@ -568,7 +640,39 @@ void setupWeb() {
     c.port   = (uint16_t)limitf(1, argF(r, "port", c.port), 65535);
     c.pubMs  = (uint16_t)limitf(500, argF(r, "pubMs", c.pubMs), 60000);
     c.mqttOn = argF(r, "mqttOn", c.mqttOn ? 1 : 0) > 0.5f;
+
+    // ---- identity, AP and addressing (0.10.0) ----
+    if (r->hasParam("label", true)) argS(r, "label", c.label, sizeof(c.label));
+    if (r->hasParam("hostName", true)) {
+      String h = netSanitizeHost(r->getParam("hostName", true)->value());
+      strncpy(c.host_name, h.c_str(), sizeof(c.host_name) - 1);
+      c.host_name[sizeof(c.host_name) - 1] = 0;
+    }
+    if (r->hasParam("apSsid", true) && r->getParam("apSsid", true)->value().length())
+      argS(r, "apSsid", c.apSsid, sizeof(c.apSsid));
+    // Blank means "keep the stored one"; shorter than 8 would silently open
+    // the AP, so it is refused rather than accepted and quietly downgraded.
+    if (r->hasParam("apPass", true) && r->getParam("apPass", true)->value().length() >= 8)
+      argS(r, "apPass", c.apPass, sizeof(c.apPass));
+
+    c.useStatic = argF(r, "useStatic", c.useStatic ? 1 : 0) > 0.5f;
+    String badq;
+    struct { const char *k; uint8_t *v; } quads[] = {
+      {"sip", c.ip}, {"gw", c.gw}, {"mask", c.mask}, {"dns", c.dns} };
+    for (auto &q : quads) {
+      if (!r->hasParam(q.k, true)) continue;
+      String v = r->getParam(q.k, true)->value();
+      v.trim();
+      if (!v.length()) { memset(q.v, 0, 4); continue; }   // blank = not set
+      if (!netParseQuad(v, q.v)) badq += String(" ") + q.k;
+    }
+
     netStage(c);
+    if (badq.length()) {
+      r->send(200, "text/plain", "Saved, but kept the previous" + badq +
+                                 " -- not a valid address.");
+      return;
+    }
     r->send(200, "text/plain", c.ssid[0]
         ? "Saved -- joining network, check status in a few seconds."
         : "Saved -- no SSID set, station radio idle.");
@@ -646,15 +750,14 @@ void setup() {
   // associates, the softAP follows it to that channel and anything joined to
   // the AP is briefly dropped.  Expected -- provision, then rejoin.
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(AP_SSID, AP_PASS);
+  netBegin();                       // loads NetCfg, raises the AP, starts the net task
   dns.start(53, "*", WiFi.softAPIP());
   setupWeb();
-  netBegin();
 
 #if SIM
   Serial.println("############################################################");
   Serial.println("##  SIM BUILD -- simulated plant, no drive is being driven ##");
-  Serial.println("##  set  #define SIM 0  for real hardware                  ##");
+  Serial.println("##  rebuild with  .\\build.ps1  for real drives             ##");
   Serial.println("############################################################");
   for (int i = 0; i < MAX_DRIVES; i++) drv[i].present = true;
 #else
@@ -666,13 +769,18 @@ void setup() {
   canBegin();
 
   Serial.println("PumpSaver firmware " FW_VERSION);
-  Serial.printf("AP %s up at %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  Serial.print(gNetLog); Serial.println();
+  if (gMdnsUp) Serial.printf("mDNS: http://%s.local/\n", gNet.host_name);
   Serial.println("t_ms,psi,spAct,hzCmd,cap,shutoff,flow,state,lead,lag,sleep,"
                  "d1Hz,d1A,d1st,d1rd,d1wr,d2Hz,d2A,d2st,d2rd,d2wr");
 }
 
 void loop() {
   dns.processNextRequest();
+
+  // A restart requested from the web UI happens here, not in the handler, so
+  // the HTTP response reaches the browser before the radio goes down.
+  if (gRebootAt && (int32_t)(millis() - gRebootAt) >= 0) ESP.restart();
 
   uint32_t now = millis();
   if (now - lastTick < TICK_MS) return;

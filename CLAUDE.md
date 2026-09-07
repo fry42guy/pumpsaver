@@ -35,10 +35,29 @@ the serial banner, the page header, and `/status`.
   hard cap is fine; a filter inserts phase lag into someone else's control loop.
 - **Measurements pass through verbatim.** Never report a corrected or invented
   value as if it were measured — it destroys the operator's ability to diagnose.
+- **Never give an element an `id` that shadows a global.** A bare `id` is reachable
+  as a window property, but real window properties win — `id="alert"` resolves to
+  `window.alert`, not the element. Same trap that once stopped the Cmd tile updating.
+
+- **A form must be able to read back every field it writes.** If a `/xxx` GET does
+  not return a field its POST accepts, the form renders it empty and saving writes
+  `"".toFloat()` = 0 over the stored value. This silently disabled the CAN
+  gateway's P-01/P-02 enforcement until v0.10.0.
+
+- **`SIM` is set by `build.ps1 -Sim`, never by editing the define.** It writes a
+  generated, gitignored `sim_flag.h`, so the demo and real-drive binaries come
+  from one commit — which is what makes a board matchable to a commit.
+
+- **In `build.ps1`, test `$LASTEXITCODE`, never `$?`.** In Windows PowerShell 5.1 a
+  native command that writes anything to stderr — a compiler warning is enough —
+  sets `$?` false even on exit code 0.
+
 - **The web page lives in `page.h`, never in the `.ino`.** Arduino generates C++
   prototypes by scanning `.ino` files and does not understand raw string literals,
   so a line like `function foo(){` inside `R"HTML(...)HTML"` breaks the build with
-  *"'function' does not name a type"*. `.h` files are not preprocessed.
+  *"'function' does not name a type"*. `.h` files are not preprocessed. `page.h` is
+  the hub; the screens are `page_home.h`, `page_pump.h`, `page_net.h` and
+  `page_system.h`, all sharing the design system in `ui_common.h`.
 
 ## Build environment
 

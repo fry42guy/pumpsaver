@@ -7,3 +7,4 @@ build/
 test/*.exe
 test/*.obj
 test/*.pdb
+sim_flag.h
