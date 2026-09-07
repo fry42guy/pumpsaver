@@ -35,7 +35,7 @@ const char *FW_VERSION_STR = FW_VERSION;
 // Bump FW_VERSION on every change pass before flashing.  The number is shown
 // on the serial banner, in the page header and in /status, so a board in the
 // field can always be matched to a commit.  See VERSION.md for the log.
-#define FW_VERSION "0.7.0"
+#define FW_VERSION "0.8.0"
 
 // ---------------------------------------------------------------- build mode
 // 1 = simulated plant, no drive or RS485 needed.  0 = real drives over Modbus.
@@ -142,6 +142,8 @@ private:
 Rtu rtu;
 
 // ---------------------------------------------------------------- drives
+bool gwOwnsDrive();            // can_gw.h -- PLC owns the drive over CAN
+
 struct Drive {
   uint8_t  addr    = 0;
   bool     present = false;      // found by discovery, remembered afterwards
@@ -275,6 +277,12 @@ void pollDrive(Drive &d) {
 
 void commandDrive(Drive &d, bool run, float hz, bool reset) {
   if (!d.present) return;
+  // In gateway mode the PLC owns this drive: its speed reference arrives on
+  // CAN and is written by can_gw.h. Two writers on one Modbus link would
+  // fight at whatever rate each happens to run, so the local loop stands
+  // down. Declared here rather than at the call site because every path
+  // that commands a drive goes through this function.
+  if (gwOwnsDrive()) return;
   uint16_t w[2];
   w[0] = (run ? 1 : 0) | (reset ? 4 : 0);
   w[1] = (uint16_t)(limitf(0, hz, 60.0f) * 10.0f + 0.5f);
@@ -284,6 +292,7 @@ void commandDrive(Drive &d, bool run, float hz, bool reset) {
 
 // ---------------------------------------------------------------- web page
 #include "config_io.h"
+#include "can_gw.h"
 #include "page.h"
 
 // ---------------------------------------------------------------- json
@@ -543,6 +552,35 @@ void setupWeb() {
     r->send(res);
   });
 
+  server.on("/can", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send(200, "application/json", canStatusJSON());
+  });
+
+  server.on("/cantrace", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send(200, "text/plain", canTraceText());
+  });
+
+  // Changing bus role or node ID mid-run is not something to do live, and
+  // the TWAI driver is installed once at boot, so this saves and asks for a
+  // reboot rather than pretending it took effect.
+  server.on("/canset", HTTP_POST, [](AsyncWebServerRequest *r) {
+    CanCfg c = canCurrent();
+    c.enable     = argF(r, "enable",     c.enable     ? 1 : 0) > 0.5f;
+    c.listenOnly = argF(r, "listenOnly", c.listenOnly ? 1 : 0) > 0.5f;
+    c.capEnforce = argF(r, "capEnforce", c.capEnforce ? 1 : 0) > 0.5f;
+    c.node       = (uint8_t) limitf(1,  argF(r, "node",      c.node),      127);
+    c.hbMs       = (uint16_t)limitf(50, argF(r, "hbMs",      c.hbMs),      3000);
+    c.pdoMs      = (uint16_t)limitf(20, argF(r, "pdoMs",     c.pdoMs),     1000);
+    c.driveAddr  = (uint8_t) limitf(0,  argF(r, "driveAddr", c.driveAddr), 247);
+    c.vendor     = (uint32_t)argF(r, "vendor",   c.vendor);
+    c.product    = (uint32_t)argF(r, "product",  c.product);
+    c.revision   = (uint32_t)argF(r, "revision", c.revision);
+    c.serial     = (uint32_t)argF(r, "serial",   c.serial);
+    c.devType    = (uint32_t)argF(r, "devType",  c.devType);
+    canStage(c);
+    r->send(200, "text/plain", "Saved. Reboot to apply the bus settings.");
+  });
+
   server.on("/import", HTTP_POST, [](AsyncWebServerRequest *r) {
     if (!r->hasParam("cfg", true)) { r->send(400, "text/plain", "No config supplied."); return; }
     bool withNet = r->hasParam("withNet", true) &&
@@ -591,6 +629,8 @@ void setup() {
   lastLog = discover();
   Serial.print(lastLog);
 #endif
+
+  canBegin();
 
   Serial.println("PumpSaver firmware " FW_VERSION);
   Serial.printf("AP %s up at %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());

@@ -218,6 +218,33 @@ around.</div>
 </form>
 </section>
 
+<section><h2>PLC gateway (CAN)</h2>
+<div class="hint" style="margin:0 0 8px">Makes this board answer the skid PLC as if it were the
+drive, on CAN node 1, and pass the commands through to the real drive over Modbus. <b>No CODESYS
+changes.</b> The PLC's P-01 cavitation cap is enforced here, one link before the drive.<br>
+<b>Listen mode</b> transmits nothing &mdash; put the board on a working PLC+drive bus, power-cycle
+the PLC, and the log below captures the CANopen Manager's startup and the drive's real identity
+values. Fill those in before going live.</div>
+<div id="cst" class="st">&hellip;</div>
+<form id="cf" onsubmit="return saveCan()">
+<label>Gateway on<input type="number" step="1" min="0" max="1" name="enable"></label>
+<label>Listen only<input type="number" step="1" min="0" max="1" name="listenOnly"></label>
+<label>Enforce P-01 / P-02<input type="number" step="1" min="0" max="1" name="capEnforce"></label>
+<label>Node ID<input type="number" step="1" name="node"></label>
+<label>Drive address (0 = first found)<input type="number" step="1" name="driveAddr"></label>
+<label>Heartbeat ms<input type="number" step="10" name="hbMs"></label>
+<label>TX PDO ms<input type="number" step="10" name="pdoMs"></label>
+<label>Identity vendor<input type="number" step="1" name="vendor"></label>
+<label>Identity product<input type="number" step="1" name="product"></label>
+<label>Identity revision<input type="number" step="1" name="revision"></label>
+<label>Device type 0x1000<input type="number" step="1" name="devType"></label>
+<button type="submit">Save gateway</button>
+<button type="button" class="grey" onclick="canTrace()">Show frame log</button>
+</form>
+<pre id="ctr" style="display:none;overflow:auto;max-height:280px;background:#111;color:#9f9;
+padding:8px;border-radius:4px;font-size:11px;line-height:1.35"></pre>
+</section>
+
 <section><h2>Backup &amp; restore</h2>
 <div class="hint" style="margin:0 0 8px">Every setting on this page as a JSON file &mdash; commission
 one skid, then paste the same config into the rest. <b>Passwords are never included</b>, so a config
@@ -457,9 +484,44 @@ async function saveNet(){
   return false;
 }
 
+const cf=document.getElementById('cf');
+async function loadCan(){
+  const j=await(await fetch('/can')).json();
+  for(const k of ['node','driveAddr','hbMs','pdoMs','vendor','product','revision','devType'])
+    if(cf.elements[k]&&j[k]!==undefined)cf.elements[k].value=j[k];
+  cf.elements.enable.value=j.enable?1:0;
+  cf.elements.listenOnly.value=j.listen?1:0;
+  const d=document.getElementById('cst');
+  let t;
+  if(!j.enable){t='Gateway off &mdash; this board is running its own loop.';}
+  else if(j.listen){t='<b>Listen only</b> &middot; '+j.frames+' frames captured &middot; transmitting nothing';}
+  else{
+    t='Node '+j.node+' &middot; <b>'+j.nmt+'</b> &middot; '+j.frames+' frames &middot; '+j.sdo+' SDO'
+      +(j.aborts?' ('+j.aborts+' aborted)':'');
+    t+='<br>PLC asks '+j.refHz.toFixed(1)+' Hz, drive gets <b>'+j.appliedHz.toFixed(1)+' Hz</b>'
+      +(j.clamp!=='none'?' &mdash; held by '+j.clamp:'');
+    t+='<br>P-01 '+j.p01Hz.toFixed(1)+' Hz &middot; P-02 '+j.p02Hz.toFixed(1)+' Hz &middot; P-12 '+j.p12;
+    t+='<br>Modbus link '+(j.link?'up':'<b>down &mdash; not transmitting</b>');
+  }
+  d.innerHTML=t;
+  d.className='st'+((j.enable&&!j.listen&&(!j.link||j.nmt!=='operational'))?' bad':'');
+}
+async function saveCan(){
+  const d=new URLSearchParams(new FormData(cf));
+  log.textContent=await(await fetch('/canset',{method:'POST',body:d})).text();
+  setTimeout(loadCan,800);
+  return false;
+}
+async function canTrace(){
+  const e=document.getElementById('ctr');
+  e.style.display='block';
+  e.textContent=await(await fetch('/cantrace')).text();
+  e.scrollTop=e.scrollHeight;
+}
 async function save(){const d=new URLSearchParams(new FormData(f));
 log.textContent=await(await fetch('/set',{method:'POST',body:d})).text();
 trail=[];await loadS();return false;}
 async function sendCmd(c){log.textContent=await(await fetch('/cmd?c='+c,{method:'POST'})).text();}
-loadS();loadNet();tick();setInterval(tick,1000);setInterval(loadNet,5000);
+loadS();loadNet();loadCan();tick();setInterval(tick,1000);
+setInterval(loadNet,5000);setInterval(loadCan,2000);
 </script></body></html>)HTML";

@@ -35,6 +35,9 @@
 - [ ] Drive fault auto-retry with a backoff and an attempt limit
 - [x] Station WiFi + MQTT telemetry, on their own core-0 task (v0.6.0)
 - [x] Config export / import as named JSON, secrets excluded (v0.7.0)
+- [x] CAN gateway: board answers the AIO PLC as the drive, no CODESYS changes (v0.8.0)
+- [ ] Capture a real PLC+drive bus in listen mode and pin the 0x1018 identity values
+- [ ] Confirm on the bench that Modbus reg 6 and the CAN status word are bit-identical
 - [ ] Decide whether MQTT is ever allowed to write (setpoint / start / stop)
 - [ ] TLS to the broker, and per-device credentials rather than one shared login
 - [ ] Runtime hour counters per drive
