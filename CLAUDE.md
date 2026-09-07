@@ -35,10 +35,23 @@ the serial banner, the page header, and `/status`.
   hard cap is fine; a filter inserts phase lag into someone else's control loop.
 - **Measurements pass through verbatim.** Never report a corrected or invented
   value as if it were measured — it destroys the operator's ability to diagnose.
-- **The web page lives in `page.h`, never in the `.ino`.** Arduino generates C++
+- **The web pages live in `.h` files, never in the `.ino`.** Arduino generates C++
   prototypes by scanning `.ino` files and does not understand raw string literals,
   so a line like `function foo(){` inside `R"HTML(...)HTML"` breaks the build with
   *"'function' does not name a type"*. `.h` files are not preprocessed.
+  `page.h` is the hub; the screens are `page_easy.h`, `page_adv.h`, `page_wifi.h`,
+  sharing chrome from `ui_common.h`.
+
+- **Never give an element an `id` that shadows a global.** A bare `id` is reachable
+  as a window property, but real window properties win — `id="alert"` resolves to
+  `window.alert`, not the element. Same trap that once stopped the Cmd tile updating.
+
+- **Wi-Fi config stays out of the pump `Settings` blob.** It has its own NVS
+  namespace in `net.h`, so bumping the control-settings magic never wipes the
+  credentials that put a board on the network, and vice versa.
+
+- **The AP always comes up.** A wrong SSID must never strand a board. See
+  `netStart()` and ECOSYSTEM.md.
 
 ## Build environment
 

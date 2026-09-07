@@ -8,6 +8,7 @@
 | **G2** | One real drive, one pump, holding pressure | not started | needs a drive on the bench |
 | **G3** | Two drives, lead/lag staging, on a real skid | not started | G2 + second drive addressed |
 | **G4** | Mode 2 — CAN gateway to the CR1082 | blocked | open questions 4–7 in DESIGN_NOTES |
+| **G5** | Several nodes on one site, coordinated | groundwork done | plan and open questions in ECOSYSTEM.md |
 
 ## Phase 1 — offline skid (current)
 
@@ -21,6 +22,8 @@
 - [x] Desktop harness — real control block, no board (v0.3.0)
 - [x] Verify a full sleep cycle: fill → regulate → charge → asleep → wake
       (harness, 1.5 gpm: 2 cycles; 0 gpm: sleeps and stays; 40 gpm: correctly never sleeps)
+- [x] Three-screen UI — operator landing page, advanced page, Wi-Fi setup (v0.6.0)
+- [x] Node identity (name / role / id), station mode, static IP, mDNS (v0.6.0)
 - [ ] **Tune Kp/Ki against the sim** and record the result
 - [ ] Verify staging up and down with hysteresis, and `lagMinRunS`
 - [ ] Bench test against one real drive

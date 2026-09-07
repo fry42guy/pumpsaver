@@ -45,7 +45,7 @@ sleep state machine and staging on the bench with no drive, no motor and no wate
 
 1. Flash, open Serial Monitor at 115200. A red SIM banner prints.
 2. Join Wi-Fi **FCW-PUMP** / **fullcircle**, browse to `http://192.168.4.1`.
-3. Set **Time scale ×10** and **Demand 0 gpm**. Tap **Enable**.
+3. Open **Advanced**, set **Time scale ×10** and **Demand 0 gpm**. Tap **Enable**.
 4. Watch fill → regulate. It settles at 55.0 psi and **48.5 Hz** — exactly the
    shutoff speed. After the two 60 s holds it charges to 60 psi and sleeps.
 
@@ -65,6 +65,19 @@ is not a trickle. To see a full sleep/wake cycle set demand to **1–2 gpm**.
 
 The serial CSV is one line per 100 ms tick:
 `t_ms,psi,spAct,hzCmd,cap,shutoff,flow,state,lead,lag,sleep`
+
+## The three screens
+
+| URL | Screen | For |
+|---|---|---|
+| `/` | **Easy** | Running it. Pressure, setpoint, start/stop, and what the drives report back. |
+| `/adv` | **Advanced** | Every parameter, the operating-envelope plot, full loop diagnostics, the sim. |
+| `/wifi` | **Wi-Fi** | AP settings, joining a network, static IP, node name / role / id. |
+
+The board's own AP stays up even when it has joined a network, so it can always
+be reached standing at the skid — a wrong SSID cannot strand a board. Saving on
+the Wi-Fi screen reboots. See [ECOSYSTEM.md](ECOSYSTEM.md) for how this is meant
+to scale past one node.
 
 ## Going to real hardware
 
@@ -87,8 +100,14 @@ the drive stops on its own. Confirm it is set.
 | `pumpsaver.ino` | I/O, Modbus master, web UI, main tick |
 | `pump_control.h` | the control block — pure, no Arduino deps, desktop-compilable |
 | `plant_sim.h` | bench plant model |
-| `page.h` | the web UI, kept out of the .ino for a build reason (see DESIGN_NOTES) |
+| `page.h` | includes the three screens — kept out of the .ino for a build reason |
+| `ui_common.h` | shared CSS and nav bar, as macros so each page stays one PROGMEM string |
+| `page_easy.h` | screen 1, `/` — operator landing page |
+| `page_adv.h` | screen 2, `/adv` — every parameter, envelope plot, diagnostics |
+| `page_wifi.h` | screen 3, `/wifi` — network and node identity |
+| `net.h` | Wi-Fi config, mDNS, node identity; its own NVS namespace |
 | `test/harness.cpp` | desktop co-simulation — runs the real control block with no board |
 | `DESIGN_NOTES.md` | decisions and why, open questions |
+| `ECOSYSTEM.md` | how several nodes on one site are meant to work |
 | `ROADMAP.md` | phases and goal tracking |
 | `VERSION.md` | version log and flash record |

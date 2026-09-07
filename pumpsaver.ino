@@ -26,20 +26,22 @@
 #include <ESPAsyncWebServer.h>
 #include "pump_control.h"
 #include "plant_sim.h"
+#include "net.h"
 
 // ---------------------------------------------------------------- version
 // Bump FW_VERSION on every change pass before flashing.  The number is shown
 // on the serial banner, in the page header and in /status, so a board in the
 // field can always be matched to a commit.  See VERSION.md for the log.
-#define FW_VERSION "0.5.0"
+#define FW_VERSION "0.6.0"
 
 // ---------------------------------------------------------------- build mode
 // 1 = simulated plant, no drive or RS485 needed.  0 = real drives over Modbus.
 // The web page shows an unmissable banner while this is 1.
 #define SIM 1
 
-#define AP_SSID        "FCW-PUMP"
-#define AP_PASS        "fullcircle"
+// The AP SSID and password are no longer compiled in -- they live in NetCfg
+// (net.h, its own NVS namespace) so they can be changed from the Wi-Fi screen
+// without a reflash.  The factory defaults are still FCW-PUMP / fullcircle.
 #define RS485_RX       18
 #define RS485_TX       17
 #define RS485_DE       21
@@ -187,6 +189,7 @@ PlantSim    plant;
 bool     gEnable  = false;       // NOT persisted -- a power cut must not restart the pump
 bool     gLockout = false;       // local inhibit, survives nothing either
 uint32_t gCmdReset = 0;
+uint32_t gRebootAt = 0;          // set by /wifi/set; 0 = no restart pending
 uint32_t lastTick = 0, tickN = 0;
 float    gPsiRaw = 0;
 bool     gPsiValid = false;
@@ -291,6 +294,10 @@ String statusJSON() {
   j += ",\"capHz\":" + String(pout.capHz, 1) + ",\"shutoffHz\":" + String(pout.shutoffHz, 1);
   j += ",\"state\":" + String(pout.state) + ",\"enable\":" + String(gEnable ? "true" : "false");
   j += ",\"sleepCycles\":" + String(pc.sleepCycles);
+  // Controller uptime, not the browser's -- a reader has to be able to tell
+  // that the board rebooted under them.  Seconds since boot.
+  j += ",\"up\":" + String(millis() / 1000UL);
+  j += ",\"node\":" + jstr(N.node);
   j += ",\"addr1\":" + String(addr1Occupied ? "true" : "false");
   j += ",\"flow\":" + String(plant.flowGPM, 1) + ",\"hzAct\":" + String(plant.hzAct, 1);
   j += ",\"drives\":[";
@@ -400,8 +407,25 @@ float argF(AsyncWebServerRequest *r, const char *k, float d) {
   return r->hasParam(k, true) ? r->getParam(k, true)->value().toFloat() : d;
 }
 
+// mDNS labels and SSIDs are not the same alphabet.  A node name becomes a
+// hostname, so fold it to [a-z0-9-] here rather than discovering later that
+// "Pump #1" resolves for nobody.
+String sanitizeNode(const String &in) {
+  String o;
+  for (size_t i = 0; i < in.length() && o.length() < 22; i++) {
+    char c = in[i];
+    if (c >= 'A' && c <= 'Z') c += 32;
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) o += c;
+    else if ((c == '-' || c == ' ' || c == '_') && o.length() && o[o.length() - 1] != '-') o += '-';
+  }
+  while (o.length() && o[o.length() - 1] == '-') o.remove(o.length() - 1);
+  return o.length() ? o : String("pump-1");
+}
+
 void setupWeb() {
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE); });
+  server.on("/",     HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_EASY); });
+  server.on("/adv",  HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_ADV); });
+  server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_WIFI); });
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "application/json", statusJSON()); });
   server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "application/json", settingsJSON()); });
   server.on("/diag", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "application/json", diagJSON()); });
@@ -481,7 +505,64 @@ void setupWeb() {
     else r->send(400, "text/plain", "unknown cmd");
   });
 
-  server.onNotFound([](AsyncWebServerRequest *r) { r->redirect("http://192.168.4.1/"); });
+  // ---------------------------------------------------------------- network
+  server.on("/net", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send(200, "application/json", netJSON());
+  });
+
+  server.on("/wifi/scan", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send(200, "application/json", netScanJSON(r->hasParam("start")));
+  });
+
+  server.on("/wifi/set", HTTP_POST, [](AsyncWebServerRequest *r) {
+    auto P = [r](const char *k) {
+      return r->hasParam(k, true) ? r->getParam(k, true)->value() : String();
+    };
+    auto has = [r](const char *k) { return r->hasParam(k, true); };
+
+    if (has("node")) copyStr(N.node, sizeof(N.node), sanitizeNode(P("node")));
+    if (has("role")) copyStr(N.role, sizeof(N.role), P("role"));
+    if (has("id"))   N.id = (uint8_t)limitf(1, P("id").toFloat(), 250);
+
+    if (has("apOn"))   N.apOn  = P("apOn").toInt() != 0;
+    if (has("apSsid") && P("apSsid").length()) copyStr(N.apSsid, sizeof(N.apSsid), P("apSsid"));
+    // A blank password field means "leave the stored one alone", so that the
+    // page never has to be shown the current password to be able to save.
+    if (has("apPass") && P("apPass").length() >= 8) copyStr(N.apPass, sizeof(N.apPass), P("apPass"));
+
+    if (has("staOn")) N.staOn = P("staOn").toInt() != 0;
+    if (has("ssid"))  copyStr(N.ssid, sizeof(N.ssid), P("ssid"));
+    if (has("pass") && P("pass").length()) copyStr(N.pass, sizeof(N.pass), P("pass"));
+
+    if (has("useStatic")) N.useStatic = P("useStatic").toInt() != 0;
+    // parseQuad leaves the old value in place on a bad string rather than
+    // half-applying an address.  The page validates first; this is the backstop.
+    String bad;
+    if (has("ip")   && P("ip").length()   && !parseQuad(P("ip"),   N.ip))   bad += " address";
+    if (has("gw")   && P("gw").length()   && !parseQuad(P("gw"),   N.gw))   bad += " gateway";
+    if (has("mask") && P("mask").length() && !parseQuad(P("mask"), N.mask)) bad += " mask";
+    if (has("dns")  && P("dns").length()  && !parseQuad(P("dns"),  N.dns))  bad += " DNS";
+
+    netSave();
+    gRebootAt = millis() + 800;      // let the response actually go out first
+    r->send(200, "text/plain", bad.length()
+        ? ("Saved, but kept the previous" + bad + " -- it did not parse. Rebooting.")
+        : String("Saved. Rebooting."));
+  });
+
+  // Captive-portal catch-all, but ONLY for requests that actually arrived on
+  // the AP interface.  Bouncing everything to the softAP address was fine
+  // when that was the only way in; now that the board can also be a station,
+  // it would send a mistyped URL on the site network to 192.168.4.1, which is
+  // not reachable from there.  On the AP we still need an absolute URL, since
+  // the OS connectivity check asks for a URL on someone else's host.
+  server.onNotFound([](AsyncWebServerRequest *r) {
+    IPAddress ap = WiFi.softAPIP();
+    if (ap != IPAddress((uint32_t)0) && r->client()->localIP() == ap)
+      r->redirect("http://" + ap.toString() + "/");
+    else
+      r->send(404, "text/plain", "not found");
+  });
   server.begin();
 }
 
@@ -500,8 +581,10 @@ void setup() {
 
   for (int i = 0; i < MAX_DRIVES; i++) drv[i].addr = FIRST_ADDR + i;
 
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASS);
+  netLoad();
+  netStart();
+  // The captive-portal DNS only ever answers queries that arrive on the AP
+  // interface, so it is harmless when the board is also a station.
   dns.start(53, "*", WiFi.softAPIP());
   setupWeb();
 
@@ -518,12 +601,19 @@ void setup() {
 #endif
 
   Serial.println("PumpSaver firmware " FW_VERSION);
-  Serial.printf("AP %s up at %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  Serial.printf("node %s (%s #%u)\n", N.node, N.role, N.id);
+  Serial.print(netLog);
+  if (mdnsUp) Serial.printf("mDNS: http://%s.local/\n", N.node);
   Serial.println("t_ms,psi,spAct,hzCmd,cap,shutoff,flow,state,lead,lag,sleep");
 }
 
 void loop() {
   dns.processNextRequest();
+
+  // A restart requested from the Wi-Fi screen happens here, not inside the
+  // request handler, so the HTTP response is on the wire before the radio
+  // goes down and the browser gets an answer instead of a dead socket.
+  if (gRebootAt && (int32_t)(millis() - gRebootAt) >= 0) ESP.restart();
 
   uint32_t now = millis();
   if (now - lastTick < TICK_MS) return;
