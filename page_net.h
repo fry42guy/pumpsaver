@@ -125,7 +125,7 @@ const sigBar=r=>'<span class="sig"><i style="width:'+
   Math.max(0,Math.min(100,2*(r+100)))+'%"></i></span>';
 
 async function loadNet(){
-  const j=await(await fetch('/net')).json();
+  const j=await(await fetch('/net',{cache:'no-store'})).json();
   const up=j.sta;
   $('netInfo').innerHTML=
     '<div><span>unit</span><b>'+esc(j.id)+(j.label?' &middot; '+esc(j.label):'')+'</b></div>'+
@@ -165,10 +165,10 @@ async function loadNet(){
 async function scanStart(){
   $('scanBtn').textContent='Scanning…';$('scanBtn').disabled=true;
   $('scanList').innerHTML='';
-  await fetch('/scan');clearTimeout(scanT);scanT=setTimeout(scanPoll,1200);
+  await fetch('/scan',{cache:'no-store'});clearTimeout(scanT);scanT=setTimeout(scanPoll,1200);
 }
 async function scanPoll(){
-  const j=await(await fetch('/scan')).json();
+  const j=await(await fetch('/scan',{cache:'no-store'})).json();
   if(j.state!='done'){scanT=setTimeout(scanPoll,900);return;}
   $('scanBtn').textContent='Scan for networks';$('scanBtn').disabled=false;
   if(!j.nets||!j.nets.length){$('scanList').innerHTML='<p class="note">Nothing found.</p>';return;}

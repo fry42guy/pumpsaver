@@ -187,7 +187,7 @@ details[open] summary:before{transform:rotate(90deg)}
     <span class="meta"><span id="devname">&nbsp;</span><br><span id="ver">&nbsp;</span></span>
   </div>
   <nav>
-    <a href="/">Home</a><a href="/pump">Pump</a><a href="/network">Network</a><a href="/system">System</a>
+    <a href="/">Home</a><a href="/pump">Pump</a><a href="/sim">Sim</a><a href="/network">Network</a><a href="/system">System</a>
   </nav>
 </div>
 <div class="banner sim" id="simbar" style="display:none">SIMULATED PLANT &mdash; NOT DRIVING REAL HARDWARE</div>
@@ -243,7 +243,7 @@ function simRange(){$('sd').min=$('sdmin').value;$('sd').max=$('sdmax').value;
  $('sp2').min=$('sp2min').value;$('sp2').max=$('sp2max').value;simEcho();}
 async function pushSim(){await post('/sim',{simMode:$('sm').value,simPsi:$('sp2').value,
  simDemandGPM:$('sd').value,simTimeScale:$('ts').value,simCapGalPsi:$('cg').value});}
-async function simLoad(){const j=await(await fetch('/settings')).json();
+async function simLoad(){const j=await(await fetch('/settings',{cache:'no-store'})).json();
  $('sd').value=j.simDemandGPM;$('ts').value=j.simTimeScale;$('cg').value=j.simCapGalPsi;
  $('sm').value=j.simMode;$('sp2').value=j.simPsi;simEcho();}
 // Live readout, fed from a /status object the page already fetched.
@@ -281,7 +281,7 @@ async function post(url,obj){const b=new URLSearchParams();
 // endpoint keeps the contract it already had.
 const swVal=el=>el.checked?1:0;
 // The chrome (version, device name, banners) is identical on all four pages.
-async function chrome(){try{const j=await(await fetch('/status')).json();
+async function chrome(){try{const j=await(await fetch('/status',{cache:'no-store'})).json();
   linkUp(true);$('ver').textContent='v'+j.ver;
   $('simbar').style.display=j.sim?'block':'none';
   $('ovrbar').style.display=j.ovr?'block':'none';

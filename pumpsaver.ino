@@ -33,7 +33,7 @@
 // field can always be matched to a commit.  See VERSION.md for the log.
 // This block must stay ABOVE FW_VERSION_STR below -- that initialiser expands
 // the macro, so defining it afterwards does not compile.
-#define FW_VERSION "0.12.0"
+#define FW_VERSION "0.13.0"
 
 // net.h needs the version string at runtime; the macro is not visible to it.
 const char *FW_VERSION_STR = FW_VERSION;
@@ -185,7 +185,35 @@ struct Drive {
   // exactly like a working one.
   bool     writeOK = false;
   uint32_t writeFails = 0;
+
+  // ---- registers beyond the status triplet, carried so the UI can show what
+  // the drive actually reports rather than what we inferred.
+  float    tempC     = 0;      // reg 24, heatsink degC
+  uint16_t aiCounts  = 0;      // reg 20, 0-1000 = 0-100 % of the 4-20 mA span
+
+  // Injected fault, simulation only.  Non-zero puts this trip code into the
+  // synthesised status word, so the sim exercises the SAME decode path as a
+  // real drive instead of a special case.  Cleared by a fault reset.
+  uint8_t  simTrip   = 0;
 };
+
+// Invertek status word: bit0 running, bit1 tripped, bit6 ready, high byte the
+// trip code.  Built here so the simulated path and the real path decode
+// identically -- a sim that bypasses the decode proves nothing about it.
+static inline uint16_t buildStatus(bool running, uint8_t trip, bool ready) {
+  uint16_t s = 0;
+  if (running) s |= 0x01;
+  if (trip)    s |= 0x02;
+  if (ready)   s |= 0x40;
+  return s | ((uint16_t)trip << 8);
+}
+
+static inline void decodeStatus(Drive &d) {
+  d.running  = d.status & 0x01;
+  d.tripped  = d.status & 0x02;
+  d.ready    = d.status & 0x40;
+  d.tripCode = d.status >> 8;
+}
 Drive drv[MAX_DRIVES];
 bool  addr1Occupied = false;     // an uncommissioned drive is sitting at 1
 
@@ -231,6 +259,17 @@ struct Settings {
      macro is now only the factory default for a board with blank NVS.       */
   bool     simOn         = SIM;
   int      simDrives     = 2;        // 1 = lead only, 2 = lead + lag
+
+  /* ---- appended in 0.13.0 -- pump identity and motor nameplate ------------
+     APPEND ONLY, same reasoning as above.  None of this reaches the control
+     block; it exists so a set of tuning numbers identifies a real machine,
+     and so measured amps can be checked against the FLA the motor is rated
+     for rather than the drive's own rating.  See pump_profile.h.           */
+  char     pumpName[28]  = "";
+  float    motorHp       = 0;
+  float    motorVolts    = 0;
+  float    motorFLA      = 0;        // nameplate full load amps
+  float    motorRPM      = 0;
 };
 Settings S;
 Preferences prefs;
@@ -338,10 +377,15 @@ void pollDrive(Drive &d) {
     d.status  = v[0];
     d.hz      = v[1] / 10.0f;
     d.amps    = v[2] / 10.0f;
-    d.running = d.status & 0x01;
-    d.tripped = d.status & 0x02;
-    d.ready   = d.status & 0x40;
-    d.tripCode = d.status >> 8;
+    decodeStatus(d);
+    // Heatsink temperature and the raw analogue count are separate reads and
+    // are not worth a bus transaction every poll -- every fourth is plenty for
+    // a thermal reading, and it keeps the tick cheap.
+    uint16_t x;
+    if ((d.fails == 0) && (tickN % (STATUS_EVERY * 4) == 0)) {
+      if (rtu.readHolding(d.addr, REG(24), 1, &x) && x <= 150) d.tempC = x;
+      if (rtu.readHolding(d.addr, REG(20), 1, &x) && x <= 1000) d.aiCounts = x;
+    }
   } else if (++d.fails >= 3) {
     d.commsOK = false;
   }
@@ -366,11 +410,26 @@ void commandDrive(Drive &d, bool run, float hz, bool reset) {
 }
 
 // ---------------------------------------------------------------- web page
+// Quote and escape a free-text field.  Only the pump name and profile names
+// are operator-typed, but one stray quote in a name would otherwise produce
+// JSON the page cannot parse, and the whole UI goes blank on a typo.
+String jstr(const char *s) {
+  String o = "\"";
+  for (const char *p = s; *p; p++) {
+    if (*p == '"' || *p == '\\') { o += '\\'; o += *p; }
+    else if ((uint8_t)*p < 0x20)  o += ' ';
+    else                          o += *p;
+  }
+  return o + "\"";
+}
+
 #include "config_io.h"
+#include "pump_profile.h"   // reuses the cfg* reader above
 #include "can_gw.h"
 #include "page.h"
 
 // ---------------------------------------------------------------- json
+
 String statusJSON() {
   String j = "{";
   j += "\"ver\":\"" FW_VERSION "\"";
@@ -398,7 +457,11 @@ String statusJSON() {
     j += ",\"hz\":" + String(drv[i].hz, 1) + ",\"amps\":" + String(drv[i].amps, 1);
     j += ",\"running\":" + String(drv[i].running ? "true" : "false");
     j += ",\"tripped\":" + String(drv[i].tripped ? "true" : "false");
-    j += ",\"tripCode\":" + String(drv[i].tripCode) + "}";
+    j += ",\"tripCode\":" + String(drv[i].tripCode);
+    j += ",\"status\":" + String(drv[i].status);
+    j += ",\"ready\":" + String(drv[i].ready ? "true" : "false");
+    j += ",\"tempC\":" + String(drv[i].tempC, 0);
+    j += ",\"ai\":" + String(drv[i].aiCounts) + "}";
   }
   j += "]}";
   return j;
@@ -484,6 +547,9 @@ String settingsJSON() {
   j += ",\"sleepRelShutoff\":" + String(c.sleepRelShutoff ? 1 : 0);
   j += ",\"useFlow\":" + String(S.useFlow ? 1 : 0);
   j += ",\"qMax60\":" + String(S.qMax60, 0) + ",\"cavOnsetGPM\":" + String(S.cavOnsetGPM, 0);
+  j += ",\"pumpName\":" + jstr(S.pumpName);
+  j += ",\"motorHp\":" + String(S.motorHp, 1) + ",\"motorVolts\":" + String(S.motorVolts, 0);
+  j += ",\"motorFLA\":" + String(S.motorFLA, 1) + ",\"motorRPM\":" + String(S.motorRPM, 0);
   j += ",\"capTableOK\":" + String(pc.capTableOK ? "true" : "false");
   j += ",\"simOn\":" + String(S.simOn ? 1 : 0);
   j += ",\"simDrives\":" + String(S.simDrives);
@@ -504,15 +570,27 @@ float argF(AsyncWebServerRequest *r, const char *k, float d) {
   return r->hasParam(k, true) ? r->getParam(k, true)->value().toFloat() : d;
 }
 
+// Live readings must never be cached.  None of these endpoints sent any
+// cache header, so a client was free to serve a stale copy -- and clients do.
+// On /status that means a page showing a pressure that is seconds old with no
+// indication, which is indistinguishable from a controller that has stopped
+// updating.  Anything that reports state gets no-store.
+void sendNoCache(AsyncWebServerRequest *r, int code, const char *type, const String &body) {
+  AsyncWebServerResponse *res = r->beginResponse(code, type, body);
+  res->addHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  r->send(res);
+}
+
 void setupWeb() {
   server.on("/",        HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_HOME); });
   server.on("/pump",    HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_PUMP); });
+  server.on("/sim",     HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_SIM); });
   server.on("/network", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_NET); });
   server.on("/system",  HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_SYSTEM); });
-  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "application/json", statusJSON()); });
-  server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "application/json", settingsJSON()); });
-  server.on("/diag", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "application/json", diagJSON()); });
-  server.on("/log", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/plain", lastLog); });
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *r) { sendNoCache(r, 200, "application/json", statusJSON()); });
+  server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *r) { sendNoCache(r, 200, "application/json", settingsJSON()); });
+  server.on("/diag", HTTP_GET, [](AsyncWebServerRequest *r) { sendNoCache(r, 200, "application/json", diagJSON()); });
+  server.on("/log", HTTP_GET, [](AsyncWebServerRequest *r) { sendNoCache(r, 200, "text/plain", lastLog); });
 
   server.on("/set", HTTP_POST, [](AsyncWebServerRequest *r) {
     // Read raw, then clamp once through cfgClamp(). The limits live in exactly
@@ -523,6 +601,11 @@ void setupWeb() {
     S.xdcrSpanPsi  = argF(r, "xdcrSpanPsi", S.xdcrSpanPsi);
     S.qMax60       = argF(r, "qMax60", S.qMax60);
     S.cavOnsetGPM  = argF(r, "cavOnsetGPM", S.cavOnsetGPM);
+    if (r->hasParam("pumpName", true)) argS(r, "pumpName", S.pumpName, sizeof(S.pumpName));
+    S.motorHp      = limitf(0, argF(r, "motorHp",    S.motorHp),    500);
+    S.motorVolts   = limitf(0, argF(r, "motorVolts", S.motorVolts), 1000);
+    S.motorFLA     = limitf(0, argF(r, "motorFLA",   S.motorFLA),   500);
+    S.motorRPM     = limitf(0, argF(r, "motorRPM",   S.motorRPM),   10000);
     S.useFlow      = argF(r, "useFlow", S.useFlow ? 1 : 0) > 0.5f;
     c.kp           = argF(r, "kp", c.kp);
     c.ki           = argF(r, "ki", c.ki);
@@ -608,15 +691,38 @@ void setupWeb() {
     String c = r->hasParam("c") ? r->getParam("c")->value() : "";
     if      (c == "start") { gEnable = true;  r->send(200, "text/plain", "Enabled."); }
     else if (c == "stop")  { gEnable = false; r->send(200, "text/plain", "Stopped."); }
-    else if (c == "reset") { gCmdReset = millis(); r->send(200, "text/plain", "Reset pulse queued."); }
+    else if (c == "reset") {
+      gCmdReset = millis();               // real path: pulse the drive's reset bit
+      // Simulation: clear the injected trip HERE, not from the tick.  Doing it
+      // inside the 1 s pulse window raced with this handler -- a /fault posted
+      // while the window was still open was wiped before it was ever reported,
+      // and a reset issued just after one could miss the window entirely.  The
+      // pulse exists because a real drive needs the bit held; a simulated trip
+      // is just a variable, so set it where it is asked for.
+      if (S.simOn) { drv[0].simTrip = 0; drv[1].simTrip = 0; }
+      r->send(200, "text/plain", S.simOn ? "Trips cleared." : "Reset pulse queued.");
+    }
     else if (c == "scan")  {
       if (S.simOn) { r->send(200, "text/plain", "Simulation is on -- there is no bus to scan."); }
-      else { lastLog = discover(); r->send(200, "text/plain", lastLog); }
+      else { lastLog = discover(); sendNoCache(r, 200, "text/plain", lastLog); }
     }
     else r->send(400, "text/plain", "unknown cmd");
   });
 
   // Diagnostic max-Hz override.  Nothing here is written to NVS -- see gOvr.
+  // Inject or clear a drive trip.  Simulation only -- there is no way to make
+  // a real drive trip on command, and pretending otherwise would put a fake
+  // fault code on a screen next to real ones.
+  server.on("/fault", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (!S.simOn) { r->send(409, "text/plain", "Only while simulating."); return; }
+    int n    = (int)limitf(1, argF(r, "drive", 1), MAX_DRIVES);
+    int code = (int)limitf(0, argF(r, "code", 0), 255);
+    drv[n - 1].simTrip = (uint8_t)code;
+    r->send(200, "text/plain", code
+        ? "Drive " + String(n) + " tripped, code " + String(code) + "."
+        : "Drive " + String(n) + " trip cleared.");
+  });
+
   server.on("/ovr", HTTP_POST, [](AsyncWebServerRequest *r) {
     if (r->hasParam("on", true))
       gOvr = r->getParam("on", true)->value() == "1";
@@ -646,7 +752,7 @@ void setupWeb() {
     j += ",\"flash\":" + String(ESP.getFlashChipSize());
     j += ",\"mhz\":" + String(getCpuFrequencyMhz());
     j += "}";
-    r->send(200, "application/json", j);
+    sendNoCache(r, 200, "application/json", j);
   });
 
   // Restart, requested from the Network screen after an AP change.  The flag
@@ -672,12 +778,12 @@ void setupWeb() {
   });
   // ---- network -------------------------------------------------------
   server.on("/net", HTTP_GET, [](AsyncWebServerRequest *r) {
-    r->send(200, "application/json", netStatusJSON());
+    sendNoCache(r, 200, "application/json", netStatusJSON());
   });
 
   // On-demand only.  A scan takes the radio off the AP channel for a moment.
   server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *r) {
-    r->send(200, "application/json", netScanJSON());
+    sendNoCache(r, 200, "application/json", netScanJSON());
   });
 
   // Stages the change; the net task applies it.  WiFi calls must not be made
@@ -738,6 +844,59 @@ void setupWeb() {
   // ---- backup / restore ----------------------------------------------
   // Named JSON, not the NVS blob: a file written by this firmware has to stay
   // readable by later firmware.  Passwords are never in it.
+  // ---------------------------------------------------------------- profiles
+  server.on("/profiles", HTTP_GET, [](AsyncWebServerRequest *r) {
+    sendNoCache(r, 200, "application/json", profListJSON());
+  });
+
+  server.on("/profile", HTTP_GET, [](AsyncWebServerRequest *r) {
+    // The pump block as it stands right now, for export.
+    sendNoCache(r, 200, "application/json",
+            profJSON(profCapture(S, pc.cfg, S.pumpName[0] ? S.pumpName : "unnamed")));
+  });
+
+  server.on("/profile/apply", HTTP_POST, [](AsyncWebServerRequest *r) {
+    PumpProfile p;
+    if (r->hasParam("json", true)) {
+      p = profParse(r->getParam("json", true)->value());
+    } else if (r->hasParam("id", true)) {
+      if (!profById(r->getParam("id", true)->value(), p)) {
+        r->send(404, "text/plain", "No such profile."); return;
+      }
+    } else { r->send(400, "text/plain", "Need id or json."); return; }
+
+    PumpCfg c = pc.cfg;
+    profApply(p, S, c);
+    cfgClamp(S, c);                 // one clamp, shared with /set and import
+    pc.cfg = c;
+    plant.qMax60       = S.qMax60;
+    plant.shutoffPsi60 = c.shutoffPsiAt60;
+    saveSettings();
+    // Applying a pump does NOT touch setpoint, sleep or staging: those belong
+    // to the installation, not to the pump.  Say so, so nobody assumes it did.
+    r->send(200, "text/plain", String("Applied \"") + p.name +
+            "\". Setpoint, sleep and staging left as they were." +
+            (pc.capTableOK ? "" : " WARNING: cap table not monotonic."));
+  });
+
+  server.on("/profile/save", HTTP_POST, [](AsyncWebServerRequest *r) {
+    int slot = (int)limitf(0, argF(r, "slot", 0), PROFILE_SLOTS - 1);
+    String nm = r->hasParam("name", true) ? r->getParam("name", true)->value() : String("");
+    nm.trim();
+    if (!nm.length()) { r->send(400, "text/plain", "Give the profile a name."); return; }
+    gProf.slot[slot] = profCapture(S, pc.cfg, nm.c_str());
+    gProf.used[slot] = true;
+    profSave();
+    r->send(200, "text/plain", "Saved to slot " + String(slot + 1) + " as \"" + nm + "\".");
+  });
+
+  server.on("/profile/delete", HTTP_POST, [](AsyncWebServerRequest *r) {
+    int slot = (int)limitf(0, argF(r, "slot", 0), PROFILE_SLOTS - 1);
+    gProf.used[slot] = false;
+    profSave();
+    r->send(200, "text/plain", "Slot " + String(slot + 1) + " cleared.");
+  });
+
   server.on("/export", HTTP_GET, [](AsyncWebServerRequest *r) {
     String body = cfgExportJSON();
     AsyncWebServerResponse *res = r->beginResponse(200, "application/json", body);
@@ -747,7 +906,7 @@ void setupWeb() {
   });
 
   server.on("/can", HTTP_GET, [](AsyncWebServerRequest *r) {
-    r->send(200, "application/json", canStatusJSON());
+    sendNoCache(r, 200, "application/json", canStatusJSON());
   });
 
   server.on("/cantrace", HTTP_GET, [](AsyncWebServerRequest *r) {
@@ -780,7 +939,7 @@ void setupWeb() {
     bool withNet = r->hasParam("withNet", true) &&
                    r->getParam("withNet", true)->value().toInt() > 0;
     lastLog = cfgImportJSON(r->getParam("cfg", true)->value(), withNet);
-    r->send(200, "text/plain", lastLog);
+    sendNoCache(r, 200, "text/plain", lastLog);
   });
 
   server.begin();
@@ -789,11 +948,22 @@ void setupWeb() {
 // ---------------------------------------------------------------- setup/loop
 void setup() {
   Serial.begin(115200);
+  // A USB CDC write BLOCKS while the host is not draining the port, and the
+  // per-tick CSV line is written from inside the control loop.  Measured on
+  // the bench with nothing reading the port: average tick 401 ms instead of
+  // 100, with one stall of 24 SECONDS.  A pressure loop that stops for 24 s
+  // because a laptop was unplugged is not a pressure loop.
+  //
+  // Timeout 0 means a write is dropped rather than waited on.  Logging must
+  // never be able to stall control -- the CSV is diagnostic, the tick is not.
+  Serial.setTxTimeoutMs(0);
   pinMode(RS485_DE, OUTPUT); digitalWrite(RS485_DE, LOW);
   Serial1.begin(DRIVE_BAUD, SERIAL_8N1, RS485_RX, RS485_TX);
   rtu.begin(&Serial1, RS485_DE);
 
   loadSettings();
+  profLoad();                       // saved pump profiles, own NVS namespace
+  profLoad();
   pc.reset();
   plant.demandGPM = S.simDemandGPM;
   plant.capacityGalPsi = S.simCapGalPsi;
@@ -853,8 +1023,10 @@ void loop() {
   pin_.flowValid = S.useFlow;
   pin_.ovrActive = gOvr;
   pin_.ovrHz     = gOvrPct * 0.6f;        // 100 % = 60 Hz
-  pin_.lagAvail  = drv[1].present &&
-                   (S.simOn || (drv[1].commsOK && !drv[1].tripped));
+  // One rule for both paths: a lag pump is available when it is fitted, in
+  // comms, and not tripped.  Simulation used to skip the trip test, so an
+  // injected fault on the lag pump was invisible to staging.
+  pin_.lagAvail  = drv[1].present && drv[1].commsOK && !drv[1].tripped;
   bool reset = (gCmdReset && now - gCmdReset < 1000);
 
 if (S.simOn) {
@@ -870,7 +1042,9 @@ if (S.simOn) {
   float h = dtc / steps;
   for (int k = 0; k < steps; k++) {
     pin_.psi       = plant.psi;
-    pin_.psiValid  = true;
+    // An injected trip on the lead drive takes the transducer with it, so the
+    // loop sees invalid pressure and freezes -- the real failure, simulated.
+    pin_.psiValid  = (drv[0].simTrip == 0);
     pin_.flowGPM   = plant.flowGPM;
     pc.step(pin_, pout, h);
     plant.step(pout.hzCmd, (pout.runLead ? 1 : 0) + (pout.runLag ? 1 : 0), h);
@@ -878,21 +1052,45 @@ if (S.simOn) {
     // the operator dialled in, so whatever the pump just did to it is discarded.
     if (S.simMode == 1) plant.psi = S.simPsi;
   }
-  gPsiRaw = plant.psi; gPsiValid = true;
+  // ---- synthesise what the drives would be REPORTING ---------------------
+  // Injected trips are cleared by the /cmd reset handler, not here: see the
+  // comment there for why the 1 s pulse window was the wrong mechanism.
 
-  drv[0].running = pout.runLead; drv[0].hz = pout.runLead ? plant.hzAct : 0;
-  drv[1].running = pout.runLag;  drv[1].hz = pout.runLag  ? plant.hzAct : 0;
-  drv[0].amps = pout.runLead ? plant.amps : 0;
-  drv[1].amps = pout.runLag  ? plant.amps : 0;
-  drv[0].commsOK = drv[1].commsOK = true;
-  drv[0].writeOK = drv[1].writeOK = true;   // nothing is written while simulating
+  for (int i = 0; i < MAX_DRIVES; i++) {
+    Drive &d = drv[i];
+    bool want = (i == 0) ? pout.runLead : pout.runLag;
+    bool fitted = (i < S.simDrives);
+    // A tripped drive stops turning whatever the controller asks of it.
+    bool spinning = want && fitted && !d.simTrip;
 
-  // A lag pump that is not fitted must not report a speed.  applySimDrives()
-  // clears present; this keeps the readouts honest for the one that is gone.
-  if (S.simDrives < 2) {
-    drv[1].running = false; drv[1].hz = 0; drv[1].amps = 0;
-    drv[1].commsOK = false; drv[1].writeOK = false;
+    d.hz   = spinning ? plant.hzAct : 0;
+    d.amps = spinning ? plant.amps  : 0;
+
+    // Heatsink: first-order rise toward an ambient-plus-load equilibrium, so
+    // it behaves like a thermal mass instead of snapping between two numbers.
+    float tgt = 28.0f + (spinning ? 0.55f * d.hz : 0.0f);
+    d.tempC += (tgt - d.tempC) * fminf(1.0f, dtc / 90.0f);
+
+    // The transducer is on the lead drive's AI1, so only that one reads it.
+    d.aiCounts = (i == 0 && S.xdcrSpanPsi > 0)
+               ? (uint16_t)limitf(0, plant.psi / S.xdcrSpanPsi * 1000.0f, 1000)
+               : 0;
+
+    // Build the word, then decode it through the SAME function the Modbus
+    // path uses.  running/tripped/tripCode are never set directly here.
+    d.status = buildStatus(spinning, d.simTrip, fitted);
+    decodeStatus(d);
+
+    d.commsOK = fitted;
+    d.writeOK = fitted;               // nothing is written while simulating
+    if (!fitted) { d.tempC = 0; d.aiCounts = 0; }
   }
+
+  gPsiRaw = plant.psi;
+  // A tripped lead drive takes the transducer with it -- the loop must freeze
+  // and stop the pumps, exactly as it does when a real one trips.  This is the
+  // whole point of being able to inject a fault.
+  gPsiValid = !drv[0].tripped && drv[0].commsOK;
 } else {
   uint16_t ai = 0;
   Drive &src = drv[0];                       // transducer lives on the lead drive

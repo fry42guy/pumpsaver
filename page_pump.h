@@ -41,6 +41,7 @@ const char PAGE_PUMP[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset
 .tool{background:#f5f7f9;border:1px solid var(--line2);border-radius:11px;padding:11px;margin-top:10px}
 .tool .three{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px}
 .tool input{text-align:center;padding:8px;min-height:42px}
+.inj3{display:grid;grid-template-columns:96px 1fr auto;gap:8px;align-items:center}
 </style></head><body>)HTML" NAV_HTML R"HTML(
 <main>
 
@@ -93,7 +94,7 @@ const char PAGE_PUMP[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset
 
 <section id="simsec" style="display:none"><h2>Simulated plant</h2>
 <p class="note" style="margin-top:0">Switch simulation on and off, and pick 1 or 2 pumps,
-on <a href="/system">System</a>.</p>
+on <a href="/sim">Sim</a>.</p>
 )HTML" SIM_PANEL_HTML R"HTML(
 </section>
 
@@ -108,6 +109,40 @@ on <a href="/system">System</a>.</p>
 <div class="fld"><span class="k">Fill ramp<i>psi/s</i></span><input type="number" step="0.5" name="spRampPsiS"></div>
 <div class="fld"><span class="k">Fill preload<i>psi above live pressure</i></span><input type="number" step="1" name="spStepPsi"></div>
 <div class="fld"><span class="k">Transducer span<i>psi at 20&nbsp;mA</i></span><input type="number" step="5" name="xdcrSpanPsi"></div>
+</section>
+
+<section><h2>Pump profile</h2>
+<div class="fld wide"><span class="k">Load a profile<i>templates are starting points, not measurements</i></span>
+<select id="profSel"></select></div>
+<div class="row" style="margin-top:9px">
+<button type="button" onclick="profApplySel()">Load into settings</button>
+<button type="button" class="ghost sm" onclick="profShow()">Export</button>
+<button type="button" class="ghost sm" onclick="$('profIo').style.display='block'">Import</button>
+</div>
+<p class="note">Loading a profile sets the pump curve, speed limits, cap table and
+nameplate. It deliberately leaves <b>setpoint, sleep and staging</b> alone &mdash;
+those belong to the installation, not to the pump.</p>
+
+<h3>This pump</h3>
+<div class="fld"><span class="k">Name<i>e.g. Price 5 HP 460 V</i></span>
+<input name="pumpName" maxlength="27"></div>
+<div class="fld"><span class="k">Motor<i>hp</i></span><input type="number" step="0.5" name="motorHp"></div>
+<div class="fld"><span class="k">Volts</span><input type="number" step="10" name="motorVolts"></div>
+<div class="fld"><span class="k">Nameplate FLA<i>amps; measured current is checked against this</i></span>
+<input type="number" step="0.1" name="motorFLA"></div>
+<div class="fld"><span class="k">Rated rpm</span><input type="number" step="10" name="motorRPM"></div>
+
+<h3>Save the current settings as a profile</h3>
+<div class="inj3">
+<select id="profSlot"></select>
+<input id="profName" maxlength="27" placeholder="profile name">
+<button type="button" class="ghost sm" onclick="profSave()">Save</button>
+</div>
+
+<div id="profIo" style="display:none">
+<textarea id="profTa" placeholder="Paste a profile JSON here, then Apply" style="margin-top:9px"></textarea>
+<div class="row"><button type="button" class="ghost sm" onclick="profApplyJson()">Apply pasted profile</button></div>
+</div>
 </section>
 
 <section><h2>Pump curve</h2>
@@ -306,7 +341,7 @@ async function tick(){
   if(SET){if(j.state!=0&&j.psiValid){trail.push([j.psi,j.hzCmd]);if(trail.length>300)trail.shift();}
           drawGraph(j,SET);}
   if(j.sim)simTick(j);
-  drawDiag(await(await fetch('/diag')).json());
+  drawDiag(await(await fetch('/diag',{cache:'no-store'})).json());
 }
 
 // Back-solve free flow from one measured point: Q = q0*r*sqrt(1-P/(S*r^2))
@@ -319,7 +354,7 @@ function solveQ(){const hz=+$('fq').value,p=+$('fp').value,g=+$('fg').value;
  f.elements.qMax60.value=q0.toFixed(0);
  $('fout').innerHTML='<span class="ok">free flow &asymp; '+q0.toFixed(0)+' gpm &mdash; Save to keep</span>';}
 
-async function loadS(){const j=await(await fetch('/settings')).json();SET=j;
+async function loadS(){const j=await(await fetch('/settings',{cache:'no-store'})).json();SET=j;
  for(const k in j){const el=f.elements[k];if(!el)continue;
    if(el.type=='checkbox')el.checked=(+j[k])>0;else el.value=j[k];}
  for(let i=0;i<4;i++){f.elements['cp'+i].value=j.capPsi[i];f.elements['ch'+i].value=j.capHz[i];}
@@ -353,5 +388,43 @@ $('ovon').addEventListener('change',ovPush);
 )HTML" SIM_PANEL_JS R"HTML(
 
 
-loadS();simLoad();tick();setInterval(tick,1000);
+
+// ---- pump profiles --------------------------------------------------------
+// Built-ins and user slots come back as one list with ids like "b0" / "u2",
+// so adding a built-in later can never repoint a saved reference at a
+// different pump.
+async function profLoadList(){
+  const j=await(await fetch('/profiles',{cache:'no-store'})).json();
+  let o='<optgroup label="Templates">';
+  for(const p of j.builtin)o+='<option value="'+p.id+'">'+esc(p.name)+'</option>';
+  o+='</optgroup>';
+  if(j.user.length){o+='<optgroup label="Saved">';
+    for(const p of j.user)o+='<option value="'+p.id+'">'+esc(p.name)+'</option>';
+    o+='</optgroup>';}
+  $('profSel').innerHTML=o;
+  let sl='';
+  for(let i=0;i<j.slots;i++){
+    const u=j.user.find(x=>x.slot===i);
+    sl+='<option value="'+i+'">Slot '+(i+1)+(u?' — '+esc(u.name):' — empty')+'</option>';}
+  $('profSlot').innerHTML=sl;
+}
+async function profApplySel(){
+  toast(await post('/profile/apply',{id:$('profSel').value}));
+  await loadS();}
+async function profApplyJson(){
+  const t=$('profTa').value.trim();
+  if(!t){toast('Paste a profile first.',1);return;}
+  toast(await post('/profile/apply',{json:t}));
+  await loadS();}
+async function profSave(){
+  const n=$('profName').value.trim()||f.elements.pumpName.value.trim();
+  if(!n){toast('Give the profile a name.',1);return;}
+  toast(await post('/profile/save',{slot:$('profSlot').value,name:n}));
+  await profLoadList();}
+async function profShow(){
+  const t=await(await fetch('/profile',{cache:'no-store'})).text();
+  $('profIo').style.display='block';$('profTa').value=t;
+  toast('Copy this to save the profile elsewhere.');}
+
+loadS();simLoad();profLoadList();tick();setInterval(tick,1000);
 </script></body></html>)HTML";

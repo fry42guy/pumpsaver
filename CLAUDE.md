@@ -56,11 +56,32 @@ the serial banner, the page header, and `/status`.
   prototypes by scanning `.ino` files and does not understand raw string literals,
   so a line like `function foo(){` inside `R"HTML(...)HTML"` breaks the build with
   *"'function' does not name a type"*. `.h` files are not preprocessed. `page.h` is
-  the hub; the screens are `page_home.h`, `page_pump.h`, `page_net.h` and
-  `page_system.h`, all sharing the design system in `ui_common.h`.
+  the hub; the screens are `page_home.h`, `page_pump.h`, `page_sim.h`,
+  `page_net.h` and `page_system.h`, all sharing `ui_common.h`.
+
+- **Logging must never be able to stall control.** A USB CDC write blocks while
+  the host is not draining the port, and the CSV line is written from inside the
+  control tick. Measured before the fix: 401 ms average tick with a 24 s stall.
+  `Serial.setTxTimeoutMs(0)` in `setup()` — never remove it.
+
+- **Every endpoint that reports live state sends `Cache-Control: no-store`**
+  (`sendNoCache()`). Without it a client may serve a stale reading, and a page
+  showing a seconds-old pressure with no indication is indistinguishable from a
+  controller that has stopped.
+
+- **A pump profile carries the PUMP, never the installation.** `pump_profile.h`
+  applies curve, limits, cap table and nameplate; it deliberately leaves
+  setpoint, sleep and staging alone. Copying one site's setpoint onto another
+  site's pump is how you commission to the wrong pressure.
+
+- **If the link fails with core symbols undefined** (`micros`, `String`,
+  `app_main`), the arduino-cli build directory is stale. Delete
+  `%LOCALAPPDATA%\Temp\pumpsaver-build*` and rebuild; `-Clean` alone is not
+  always enough.
 
 ## Build environment
 
 Arduino IDE 2.x, esp32 core 3.3.11. Board: ESP32S3 Dev Module, USB CDC On Boot
 Enabled, Flash 16MB, PSRAM OPI (pinned in `sketch.json`). Libraries: ESPAsyncWebServer
 + AsyncTCP (ESP32Async). A full build takes ~90 s — it is not hung.
+

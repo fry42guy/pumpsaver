@@ -27,27 +27,9 @@ details .body b{color:var(--ink)}
 <section><h2>Controller</h2><div class="kv" id="sysInfo"></div></section>
 
 <section><h2>Simulation</h2>
-<div class="alert ok" id="simst" style="margin-bottom:11px">&hellip;</div>
-<div class="fld"><span class="k">Simulate the plant<i>runs the real control logic against a modelled pump and tank</i></span>
-<label class="sw"><input type="checkbox" id="simOn"><span></span></label></div>
-<div class="fld"><span class="k">Pumps on the skid</span>
-<select id="simDrives"><option value="1">1 &mdash; lead only</option>
-<option value="2">2 &mdash; lead + lag</option></select></div>
-<p class="note">The control block, the sleep state machine and staging all run
-exactly as they do on real hardware &mdash; only the pressure and the drives are
-modelled. With two pumps you can watch the speeds stay matched through a stage
-up and down; with one, staging is correctly never offered a lag pump.</p>
-<div id="simpanel">
-)HTML" SIM_PANEL_HTML R"HTML(
-<p class="note">Nothing moves until the pump is enabled &mdash; with the pump
-stopped the header correctly sits at 0 psi. Press <b>Enable</b> on
-<a href="/">Home</a>, then watch the operating point track across the envelope
-plot on <a href="/pump">Pump</a>.</p>
-</div>
-<p class="note"><b>Turning simulation on stops the pumps</b> and writes stop / 0 Hz
-to any real drive on the bus first, so a drive is never left running against
-invented feedback, and never left to trip on its own comms watchdog. Turning it
-off rescans the bus.</p>
+<p class="note" style="margin-top:0">Moved to its own screen &mdash; it now carries the
+plant controls, the pump count, the per-drive register readouts and fault injection.
+<a href="/sim">Open Sim</a>.</p>
 </section>
 
 <section><h2>PLC gateway (CAN)</h2>
@@ -151,7 +133,7 @@ const CANB=['enable','listenOnly','capEnforce'];
 async function loadSys(){
   const j=await chrome();
   try{
-    const s=await(await fetch('/sys')).json();
+    const s=await(await fetch('/sys',{cache:'no-store'})).json();
     $('sysInfo').innerHTML=
       '<div><span>firmware</span><b>v'+esc(s.ver)+'</b></div>'+
       '<div><span>unit</span><b>'+esc(s.id)+'</b></div>'+
@@ -175,7 +157,7 @@ async function loadSys(){
 let canDirty=false;
 async function loadCan(){
   if(canDirty)return;
-  const j=await(await fetch('/can')).json();
+  const j=await(await fetch('/can',{cache:'no-store'})).json();
   for(const k of CANF)if(j[k]!==undefined)$(k).value=j[k];
   $('enable').checked=!!j.enable;
   $('listenOnly').checked=!!j.listen;
@@ -203,7 +185,7 @@ async function saveCan(){
 async function canTrace(){
   const el=$('ctr');
   if(el.style.display=='block'){el.style.display='none';return;}
-  el.textContent=await(await fetch('/cantrace')).text();
+  el.textContent=await(await fetch('/cantrace',{cache:'no-store'})).text();
   el.style.display='block';
 }
 
@@ -215,41 +197,6 @@ async function doImport(){
   $('log').style.display='block';$('log').textContent=t;toast('Import done');
 }
 
-// ---- simulation -----------------------------------------------------------
-)HTML" SIM_PANEL_JS R"HTML(
-let simDirty=false;
-async function loadSim(){
-  if(simDirty)return;
-  const s=await(await fetch('/settings')).json();
-  $('simOn').checked=(+s.simOn)>0;
-  $('simDrives').value=s.simDrives;
-  const on=$('simOn').checked;
-  $('simpanel').style.display=on?'block':'none';
-  // The most common confusion: simulation is on, every number reads zero, and
-  // it looks broken. It is not -- the pump is simply not enabled, and a plant
-  // with no pump running really does sit at 0 psi. Say so.
-  let txt,cls='ok';
-  const st=await(await fetch('/status')).json();
-  if(!on)            {txt='Simulation off — running against real drives over Modbus';}
-  else if(!st.enable){txt='Simulation ON, '+s.simDrives+' pump'+(s.simDrives>1?'s':'')+
-                          ' — pump is STOPPED, so the header sits at 0 psi. Press Enable on Home.';
-                      cls='warn';}
-  else               {txt='Simulation ON, '+s.simDrives+' pump'+(s.simDrives>1?'s':'')+
-                          ' — '+st.psi.toFixed(1)+' psi, '+st.flow.toFixed(1)+' gpm, '+
-                          st.hzCmd.toFixed(1)+' Hz';
-                      cls='warn';}
-  $('simst').textContent=txt;
-  $('simst').className='alert '+cls;
-  if(on)simTick(st);
-}
-async function saveSim(){
-  simDirty=false;
-  toast(await post('/sim',{on:swVal($('simOn')),drives:$('simDrives').value}));
-  setTimeout(loadSim,600);
-}
-$('simOn').addEventListener('change',saveSim);
-$('simDrives').addEventListener('change',saveSim);
-
-loadSys();loadCan();simLoad();loadSim();
-setInterval(loadSys,5000);setInterval(loadCan,2000);setInterval(loadSim,3000);
+loadSys();loadCan();
+setInterval(loadSys,5000);setInterval(loadCan,2000);
 </script></body></html>)HTML";

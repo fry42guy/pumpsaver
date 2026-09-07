@@ -180,7 +180,7 @@ async function tick(){
   if(!j){$('banner').textContent='No link to the controller';
          $('banner').className='alert bad';return;}
 
-  if(spSet===null){const s=await(await fetch('/settings')).json();
+  if(spSet===null){const s=await(await fetch('/settings',{cache:'no-store'})).json();
     spSet=s.setpoint;spShow(Math.round(s.setpoint));}
 
   $('psi').textContent=j.psiValid?j.psi.toFixed(1):'--';
@@ -215,7 +215,7 @@ async function tick(){
 
 $('spsl').addEventListener('input',()=>{$('spbox').value=$('spsl').value;spPush();});
 $('spbox').addEventListener('change',()=>{spShow($('spbox').value);spPush();});
-async function devName(){try{const n=await(await fetch('/net')).json();
+async function devName(){try{const n=await(await fetch('/net',{cache:'no-store'})).json();
   $('devname').textContent=n.id?('unit '+n.id):'';}catch(e){}}
 devName();tick();setInterval(tick,1000);
 </script></body></html>)HTML";
