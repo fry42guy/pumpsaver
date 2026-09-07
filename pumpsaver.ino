@@ -33,7 +33,7 @@
 // field can always be matched to a commit.  See VERSION.md for the log.
 // This block must stay ABOVE FW_VERSION_STR below -- that initialiser expands
 // the macro, so defining it afterwards does not compile.
-#define FW_VERSION "0.10.0"
+#define FW_VERSION "0.11.0"
 
 // net.h needs the version string at runtime; the macro is not visible to it.
 const char *FW_VERSION_STR = FW_VERSION;
@@ -189,6 +189,11 @@ struct Drive {
 Drive drv[MAX_DRIVES];
 bool  addr1Occupied = false;     // an uncommissioned drive is sitting at 1
 
+// Present the number of pumps the operator says the simulated skid has, so a
+// single-pump skid can be exercised without the staging logic being offered a
+// lag pump that does not exist.
+void applySimDrives();           // defined once Settings is in scope
+
 // ---------------------------------------------------------------- settings
 struct Settings {
   uint32_t magic = 0x50535635;       // bump when the layout changes
@@ -212,6 +217,20 @@ struct Settings {
   float    simDemandGPM  = 0.0f;
   float    simTimeScale  = 1.0f;
   float    simCapGalPsi  = 1.5f;
+
+  /* ---- appended in 0.11.0 -------------------------------------------------
+     APPEND ONLY, same reasoning as NetCfg: the blob is a raw byte copy and
+     Preferences::getBytes fills only as many bytes as were stored, so fields
+     added at the END read as the defaults below on a board configured by an
+     older build.  The magic therefore does not change and nobody loses a
+     tuned cap table to a UI feature.
+
+     simOn makes simulation a RUNTIME mode.  It is persisted -- a demo board
+     should still be a demo board after a power cut -- but gEnable is not, so
+     a reboot in simulation always comes back stopped.  The compile-time SIM
+     macro is now only the factory default for a board with blank NVS.       */
+  bool     simOn         = SIM;
+  int      simDrives     = 2;        // 1 = lead only, 2 = lead + lag
 };
 Settings S;
 Preferences prefs;
@@ -252,6 +271,18 @@ void loadSettings() {
   plant.qMax60         = S.qMax60;          // sim and plot share one number
   plant.shutoffPsi60   = S.c.shutoffPsiAt60;
 }
+void applySimDrives() {
+  for (int i = 0; i < MAX_DRIVES; i++) {
+    bool on = S.simOn && (i < S.simDrives);
+    drv[i].present  = on;
+    drv[i].commsOK  = on;
+    drv[i].writeOK  = on;
+    drv[i].addr     = FIRST_ADDR + i;
+    if (!on) { drv[i].running = false; drv[i].hz = 0; drv[i].amps = 0;
+               drv[i].tripped = false; drv[i].tripCode = 0; }
+  }
+}
+
 void saveSettings() {
   S.c = pc.cfg;
   prefs.begin("pumpsaver", false);
@@ -260,7 +291,9 @@ void saveSettings() {
 }
 
 // ---------------------------------------------------------------- drive i/o
-#if !SIM
+// Compiled into EVERY build now that simulation is a runtime mode rather than
+// a compile-time one.  Flash is at 37% of a 3 MB partition, so carrying both
+// paths costs nothing worth counting.
 bool probe(uint8_t addr) {
   uint16_t v[3];
   for (int try_ = 0; try_ < 3; try_++)          // one CRC hit must not hide a drive
@@ -331,7 +364,6 @@ void commandDrive(Drive &d, bool run, float hz, bool reset) {
   d.writeOK = ok;
   if (!ok) d.writeFails++;
 }
-#endif
 
 // ---------------------------------------------------------------- web page
 #include "config_io.h"
@@ -342,7 +374,8 @@ void commandDrive(Drive &d, bool run, float hz, bool reset) {
 String statusJSON() {
   String j = "{";
   j += "\"ver\":\"" FW_VERSION "\"";
-  j += ",\"sim\":" + String(SIM ? "true" : "false");
+  j += ",\"sim\":" + String(S.simOn ? "true" : "false");
+  j += ",\"simDrives\":" + String(S.simDrives);
   j += ",\"psi\":" + String(pin_.psi, 1) + ",\"psiValid\":" + String(gPsiValid ? "true" : "false");
   j += ",\"spActive\":" + String(pout.spActive, 1) + ",\"hzCmd\":" + String(pout.hzCmd, 1);
   j += ",\"capHz\":" + String(pout.capHz, 1) + ",\"shutoffHz\":" + String(pout.shutoffHz, 1);
@@ -452,6 +485,8 @@ String settingsJSON() {
   j += ",\"useFlow\":" + String(S.useFlow ? 1 : 0);
   j += ",\"qMax60\":" + String(S.qMax60, 0) + ",\"cavOnsetGPM\":" + String(S.cavOnsetGPM, 0);
   j += ",\"capTableOK\":" + String(pc.capTableOK ? "true" : "false");
+  j += ",\"simOn\":" + String(S.simOn ? 1 : 0);
+  j += ",\"simDrives\":" + String(S.simDrives);
   j += ",\"simMode\":" + String(S.simMode) + ",\"simPsi\":" + String(S.simPsi, 1);
   j += ",\"simDemandGPM\":" + String(S.simDemandGPM, 1);
   j += ",\"simTimeScale\":" + String(S.simTimeScale, 0);
@@ -532,6 +567,29 @@ void setupWeb() {
   });
 
   server.on("/sim", HTTP_POST, [](AsyncWebServerRequest *r) {
+    bool wasSim = S.simOn;
+    if (r->hasParam("on", true)) S.simOn = argF(r, "on", S.simOn ? 1 : 0) > 0.5f;
+    S.simDrives = (int)limitf(1, argF(r, "drives", S.simDrives), MAX_DRIVES);
+
+    if (S.simOn != wasSim) {
+      // Entering simulation, the loop stops feeding real pressure to the
+      // controller -- so it must also stop commanding real pumps.  Drop the
+      // run demand and write stop/0 Hz to anything actually on the bus before
+      // switching, rather than going silent and leaving the drive's P-36
+      // watchdog to trip it.  A trip would stop the pump too, but it would
+      // stop it as a FAULT that somebody then has to go and reset.
+      gEnable = false;
+      if (S.simOn)
+        for (int i = 0; i < MAX_DRIVES; i++)
+          if (drv[i].present) commandDrive(drv[i], false, 0, false);
+      applySimDrives();
+      pc.reset();
+      plant.psi = 0;
+      // Leaving simulation, the drive list is whatever discovery finds, not
+      // whatever the sim was pretending to have.
+      if (!S.simOn) { lastLog = discover(); }
+    }
+
     S.simMode      = (int)limitf(0, argF(r, "simMode", S.simMode), 1);
     S.simPsi       = limitf(0, argF(r, "simPsi", S.simPsi), 300);
     S.simDemandGPM = limitf(0, argF(r, "simDemandGPM", S.simDemandGPM), 400);
@@ -549,12 +607,8 @@ void setupWeb() {
     else if (c == "stop")  { gEnable = false; r->send(200, "text/plain", "Stopped."); }
     else if (c == "reset") { gCmdReset = millis(); r->send(200, "text/plain", "Reset pulse queued."); }
     else if (c == "scan")  {
-#if SIM
-      r->send(200, "text/plain", "SIM build -- no bus to scan.");
-#else
-      lastLog = discover();
-      r->send(200, "text/plain", lastLog);
-#endif
+      if (S.simOn) { r->send(200, "text/plain", "Simulation is on -- there is no bus to scan."); }
+      else { lastLog = discover(); r->send(200, "text/plain", lastLog); }
     }
     else r->send(400, "text/plain", "unknown cmd");
   });
@@ -573,7 +627,7 @@ void setupWeb() {
   // What is running, for the System screen.  Cheap enough to poll.
   server.on("/sys", HTTP_GET, [](AsyncWebServerRequest *r) {
     String j = "{\"ver\":\"" FW_VERSION "\",\"id\":\"" + String(gDevId) + "\"";
-    j += ",\"sim\":" + String(SIM ? "true" : "false");
+    j += ",\"sim\":" + String(S.simOn ? "true" : "false");
     j += ",\"up\":" + String(millis() / 1000UL);
     j += ",\"reset\":\"" + String(esp_reset_reason() == ESP_RST_POWERON  ? "power on"
                                : esp_reset_reason() == ESP_RST_SW        ? "software"
@@ -754,17 +808,17 @@ void setup() {
   dns.start(53, "*", WiFi.softAPIP());
   setupWeb();
 
-#if SIM
-  Serial.println("############################################################");
-  Serial.println("##  SIM BUILD -- simulated plant, no drive is being driven ##");
-  Serial.println("##  rebuild with  .\\build.ps1  for real drives             ##");
-  Serial.println("############################################################");
-  for (int i = 0; i < MAX_DRIVES; i++) drv[i].present = true;
-#else
-  delay(3000);                      // drives boot slower than this board
-  lastLog = discover();
-  Serial.print(lastLog);
-#endif
+  if (S.simOn) {
+    Serial.println("############################################################");
+    Serial.println("##  SIMULATION ON -- no drive is being driven             ##");
+    Serial.println("##  turn it off on the System screen for real drives      ##");
+    Serial.println("############################################################");
+    applySimDrives();
+  } else {
+    delay(3000);                    // drives boot slower than this board
+    lastLog = discover();
+    Serial.print(lastLog);
+  }
 
   canBegin();
 
@@ -789,20 +843,18 @@ void loop() {
   tickN++;
 
   // compress time so a 60 s sleep hold can be watched in a few seconds
-  float dtc = dt;
-#if SIM
-  dtc = dt * S.simTimeScale;
-#endif
+  float dtc = S.simOn ? dt * S.simTimeScale : dt;
 
   pin_.enable    = gEnable && !gLockout;
   pin_.setpoint  = S.setpoint;
   pin_.flowValid = S.useFlow;
   pin_.ovrActive = gOvr;
   pin_.ovrHz     = gOvrPct * 0.6f;        // 100 % = 60 Hz
-  pin_.lagAvail  = drv[1].present && (SIM || (drv[1].commsOK && !drv[1].tripped));
+  pin_.lagAvail  = drv[1].present &&
+                   (S.simOn || (drv[1].commsOK && !drv[1].tripped));
   bool reset = (gCmdReset && now - gCmdReset < 1000);
 
-#if SIM
+if (S.simOn) {
   // Co-simulate control and plant in small fixed steps.  Integrating the whole
   // tick in one Euler step is unstable: this plant is stiff near shutoff (at
   // 55 psi a 0.4 Hz change swings delivery from 2 to 16 gpm), and at time
@@ -830,8 +882,15 @@ void loop() {
   drv[0].amps = pout.runLead ? plant.amps : 0;
   drv[1].amps = pout.runLag  ? plant.amps : 0;
   drv[0].commsOK = drv[1].commsOK = true;
-  drv[0].writeOK = drv[1].writeOK = true;   // nothing is written in a sim build
-#else
+  drv[0].writeOK = drv[1].writeOK = true;   // nothing is written while simulating
+
+  // A lag pump that is not fitted must not report a speed.  applySimDrives()
+  // clears present; this keeps the readouts honest for the one that is gone.
+  if (S.simDrives < 2) {
+    drv[1].running = false; drv[1].hz = 0; drv[1].amps = 0;
+    drv[1].commsOK = false; drv[1].writeOK = false;
+  }
+} else {
   uint16_t ai = 0;
   Drive &src = drv[0];                       // transducer lives on the lead drive
   if (src.present && rtu.readHolding(src.addr, REG(20), 1, &ai) && ai <= 1000) {
@@ -853,7 +912,7 @@ void loop() {
   commandDrive(drv[0], pout.runLead, pout.runLead ? pout.hzCmd : 0, reset);
   commandDrive(drv[1], pout.runLag,  pout.runLag  ? pout.hzCmd : 0, reset);
   if (tickN % STATUS_EVERY == 0) { pollDrive(drv[0]); pollDrive(drv[1]); }
-#endif
+}
 
   // ---- 4. CSV for the bench
   // The per-drive tail is the raw Modbus evidence: what came back from regs

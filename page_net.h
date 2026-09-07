@@ -109,7 +109,7 @@ restarts.</p>
 <button type="button" onclick="saveNet()">Save network</button>
 </div>
 <script>)HTML" NAV_JS R"HTML(
-let scanT=null;
+let scanT=null,lastLog=null;
 const IDS=['label','hostName','apSsid','ssid','sip','gw','mask','dns','host','port',
            'user','topic','pubMs'];
 
@@ -141,7 +141,8 @@ async function loadNet(){
     '<div><span>signal</span><b>'+(up?j.rssi+' dBm':'&mdash;')+'</b></div>'+
     '<div><span>MQTT</span><b class="'+(j.mqtt?'ok':(j.mqttOn?'no':''))+'">'+
       (j.mqttOn?(j.mqtt?'connected':'down ('+j.mqttFails+' fails)'):'off')+'</b></div>'+
-    '<div><span>MAC</span><b>'+j.mac+'</b></div>';
+    '<div><span>MAC</span><b>'+j.mac+'</b></div>'+
+    (j.log?'<div style="grid-column:1/-1"><span>last event</span><b>'+esc(j.log)+'</b></div>':'');
 
   for(const k of IDS)if($(k)&&j[k]!==undefined)$(k).value=j[k];
   // 0.0.0.0 is the "not configured" sentinel -- show it as an empty box, not
@@ -150,7 +151,12 @@ async function loadNet(){
   $('useStatic').checked=j.useStatic;$('mqttOn').checked=j.mqttOn;
   $('pass').value='';$('mpass').value='';$('apPass').value='';
   gate();
-  if(j.log)toast(j.log);
+  // The log line is STATE, not an event: gNetLog holds the boot message for the
+  // life of the board, and this function polls every 5 s, so toasting it here
+  // popped "AP FCW-PUMP at 192.168.4.1" over and over forever. It belongs in
+  // the status card. Only an actual change is worth interrupting anyone for,
+  // and never on the first load.
+  if(j.log!==lastLog){ if(lastLog!==null&&j.log) toast(j.log); lastLog=j.log; }
 }
 
 // ---- scan ----------------------------------------------------------------

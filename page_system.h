@@ -26,6 +26,25 @@ details .body b{color:var(--ink)}
 
 <section><h2>Controller</h2><div class="kv" id="sysInfo"></div></section>
 
+<section><h2>Simulation</h2>
+<div class="alert ok" id="simst" style="margin-bottom:11px">&hellip;</div>
+<div class="fld"><span class="k">Simulate the plant<i>runs the real control logic against a modelled pump and tank</i></span>
+<label class="sw"><input type="checkbox" id="simOn"><span></span></label></div>
+<div class="fld"><span class="k">Pumps on the skid</span>
+<select id="simDrives"><option value="1">1 &mdash; lead only</option>
+<option value="2">2 &mdash; lead + lag</option></select></div>
+<p class="note">The control block, the sleep state machine and staging all run
+exactly as they do on real hardware &mdash; only the pressure and the drives are
+modelled. With two pumps you can watch the speeds stay matched through a stage
+up and down; with one, staging is correctly never offered a lag pump.<br><br>
+Set the header pressure and the demand on <a href="/pump">Pump</a>, and watch the
+operating point move on the envelope plot there.</p>
+<p class="note"><b>Turning simulation on stops the pumps</b> and writes stop / 0 Hz
+to any real drive on the bus first, so a drive is never left running against
+invented feedback, and never left to trip on its own comms watchdog. Turning it
+off rescans the bus.</p>
+</section>
+
 <section><h2>PLC gateway (CAN)</h2>
 <div class="alert ok" id="cst" style="margin-bottom:11px">&hellip;</div>
 <div class="fld"><span class="k">Gateway on<i>answer the skid PLC as if this were the drive</i></span>
@@ -191,5 +210,28 @@ async function doImport(){
   $('log').style.display='block';$('log').textContent=t;toast('Import done');
 }
 
-loadSys();loadCan();setInterval(loadSys,5000);setInterval(loadCan,2000);
+// ---- simulation -----------------------------------------------------------
+let simDirty=false;
+async function loadSim(){
+  if(simDirty)return;
+  const s=await(await fetch('/settings')).json();
+  $('simOn').checked=(+s.simOn)>0;
+  $('simDrives').value=s.simDrives;
+  const on=$('simOn').checked;
+  $('simst').textContent=on
+    ? 'Simulation ON — '+s.simDrives+' pump'+(s.simDrives>1?'s':'')+
+      ', no drive is being driven'
+    : 'Simulation off — running against real drives over Modbus';
+  $('simst').className='alert '+(on?'warn':'ok');
+}
+async function saveSim(){
+  simDirty=false;
+  toast(await post('/sim',{on:swVal($('simOn')),drives:$('simDrives').value}));
+  setTimeout(loadSim,600);
+}
+$('simOn').addEventListener('change',saveSim);
+$('simDrives').addEventListener('change',saveSim);
+
+loadSys();loadCan();loadSim();
+setInterval(loadSys,5000);setInterval(loadCan,2000);setInterval(loadSim,3000);
 </script></body></html>)HTML";
