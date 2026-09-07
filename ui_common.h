@@ -195,6 +195,69 @@ details[open] summary:before{transform:rotate(90deg)}
 <div class="toast" id="toast"></div>
 )NAV"
 
+// ---------------------------------------------------------- simulated plant
+// One source, two pages.  The controls belong next to the Simulation toggle on
+// System (that is where you switch it on) AND next to the envelope plot on Pump
+// (that is where you watch the operating point move while you drag).  Both bind
+// to the same server state and both re-read it, so they cannot disagree --
+// exactly like the setpoint appearing on both Home and Pump.
+#define SIM_PANEL_HTML R"SIMH(
+<div class="fld wide"><span class="k">Drive the plant by</span>
+<select id="sm"><option value="0">Demand &mdash; set a draw, the plant finds its own pressure</option>
+<option value="1">Pressure &mdash; hold the header where I put it</option></select></div>
+<div id="psirow">
+<div class="sl"><div class="lab"><span>Header psi</span><span class="mut">pressure mode</span></div>
+<input type="range" id="sp2" min="0" max="90" step="0.5"><input type="number" id="sp2v" step="0.5"></div>
+<div class="rng">range<input type="number" id="sp2min" value="0"><span>to</span><input type="number" id="sp2max" value="90"></div>
+</div>
+<div class="sl"><div class="lab"><span>Demand gpm</span><span class="mut">draw off the header</span></div>
+<input type="range" id="sd" min="0" max="120" step="0.5"><input type="number" id="sdv" step="0.5"></div>
+<div class="rng">range<input type="number" id="sdmin" value="0"><span>to</span><input type="number" id="sdmax" value="120"></div>
+<div class="sl"><div class="lab"><span>Time scale &times;</span><span class="mut">compress the 60 s holds</span></div>
+<input type="range" id="ts" min="1" max="60" step="1"><input type="number" id="tsv" step="1"></div>
+<div class="rng">range<input type="number" id="tsmin" value="1"><span>to</span><input type="number" id="tsmax" value="60"></div>
+<div class="sl"><div class="lab"><span>Tank gal/psi</span><span class="mut">system capacitance</span></div>
+<input type="range" id="cg" min="0.2" max="10" step="0.1"><input type="number" id="cgv" step="0.1"></div>
+<div class="rng">range<input type="number" id="cgmin" value="0.2"><span>to</span><input type="number" id="cgmax" value="10"></div>
+<div class="grid" style="margin-top:11px">
+<div class="m"><small>Header</small><b id="spsi">--<i>psi</i></b></div>
+<div class="m"><small>Delivered</small><b id="fl">--<i>gpm</i></b></div>
+<div class="m"><small>Actual speed</small><b id="ha">--<i>Hz</i></b></div>
+</div>
+)SIMH"
+
+// Sliders apply while dragging (debounced) and immediately on release, so
+// there is no Apply button to forget.
+#define SIM_PANEL_JS R"SIMJS(
+let simT=null;
+function simEcho(){$('sdv').value=$('sd').value;$('tsv').value=$('ts').value;
+ $('cgv').value=$('cg').value;$('sp2v').value=$('sp2').value;
+ $('psirow').style.display=($('sm').value=='1')?'block':'none';}
+function simDrag(){simEcho();clearTimeout(simT);simT=setTimeout(pushSim,150);}
+function simDrop(){simEcho();clearTimeout(simT);pushSim();}
+function simBox(){$('sd').value=$('sdv').value;$('ts').value=$('tsv').value;
+ $('cg').value=$('cgv').value;$('sp2').value=$('sp2v').value;simDrop();}
+function simRange(){$('sd').min=$('sdmin').value;$('sd').max=$('sdmax').value;
+ $('ts').min=$('tsmin').value;$('ts').max=$('tsmax').value;
+ $('cg').min=$('cgmin').value;$('cg').max=$('cgmax').value;
+ $('sp2').min=$('sp2min').value;$('sp2').max=$('sp2max').value;simEcho();}
+async function pushSim(){await post('/sim',{simMode:$('sm').value,simPsi:$('sp2').value,
+ simDemandGPM:$('sd').value,simTimeScale:$('ts').value,simCapGalPsi:$('cg').value});}
+async function simLoad(){const j=await(await fetch('/settings')).json();
+ $('sd').value=j.simDemandGPM;$('ts').value=j.simTimeScale;$('cg').value=j.simCapGalPsi;
+ $('sm').value=j.simMode;$('sp2').value=j.simPsi;simEcho();}
+// Live readout, fed from a /status object the page already fetched.
+function simTick(j){$('spsi').innerHTML=j.psi.toFixed(1)+'<i>psi</i>';
+ $('fl').innerHTML=j.flow.toFixed(1)+'<i>gpm</i>';
+ $('ha').innerHTML=j.hzAct.toFixed(1)+'<i>Hz</i>';}
+for(const id of ['sd','ts','cg','sp2']){
+  $(id).addEventListener('input',simDrag);$(id).addEventListener('change',simDrop);}
+for(const id of ['sdv','tsv','cgv','sp2v'])$(id).addEventListener('change',simBox);
+for(const id of ['sdmin','sdmax','tsmin','tsmax','cgmin','cgmax','sp2min','sp2max'])
+  $(id).addEventListener('change',simRange);
+$('sm').addEventListener('change',simDrop);
+)SIMJS"
+
 // Shared helpers.  Kept tiny and dependency-free -- this has to parse and run
 // on whatever browser is on the phone in someone's pocket.
 #define NAV_JS R"NAVJS(

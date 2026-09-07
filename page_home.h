@@ -117,20 +117,29 @@ function trendDraw(sp){
   let lo=sp-6,hi=sp+6;
   for(const p of hist){lo=Math.min(lo,p[0]);hi=Math.max(hi,p[0]);}
   if(hi-lo<4){const m=(hi+lo)/2;lo=m-2;hi=m+2;}
+  // Flow gets its own autoscale with a sane floor, so a 2 gpm trickle is still
+  // a visible line rather than being flattened against the axis by one earlier
+  // 90 gpm peak.
+  let qhi=10; for(const p of hist) qhi=Math.max(qhi,p[2]);
   const x=i=>i/Math.max(n-1,1)*W;
   const yp=v=>H-3-(v-lo)/(hi-lo)*(H-8);
   const yh=v=>H-3-Math.min(Math.max(v,0),60)/60*(H-8);
+  const yq=v=>H-3-Math.min(Math.max(v,0),qhi)/qhi*(H-8);
   const path=(f,k)=>hist.map((p,i)=>(i?'L':'M')+x(i).toFixed(1)+' '+f(p[k]).toFixed(1)).join('');
   let o='';
   o+='<line x1="0" y1="'+yp(sp).toFixed(1)+'" x2="'+W+'" y2="'+yp(sp).toFixed(1)+
      '" stroke="rgba(255,255,255,.42)" stroke-dasharray="4 4"/>';
-  o+='<path d="'+path(yh,1)+'" fill="none" stroke="rgba(255,255,255,.38)" stroke-width="1.2"/>';
+  o+='<path d="'+path(yh,1)+'" fill="none" stroke="rgba(255,255,255,.34)" stroke-width="1.2"/>';
+  o+='<path d="'+path(yq,2)+'" fill="none" stroke="rgba(150,235,200,.85)" stroke-width="1.4"'+
+     ' stroke-dasharray="3 2.5"/>';
   o+='<path d="'+path(yp,0)+'L'+W+' '+H+'L0 '+H+'Z" fill="rgba(255,255,255,.12)"/>';
   o+='<path d="'+path(yp,0)+'" fill="none" stroke="#fff" stroke-width="2"'+
      ' stroke-linejoin="round" vector-effect="non-scaling-stroke"/>';
   el.innerHTML=o;
-  $('tspan').textContent=n+'s window · '+lo.toFixed(0)+'-'+hi.toFixed(0)+' psi';
-  $('tnow').textContent='speed 0-60 Hz';
+  $('tspan').innerHTML='<b>&#9473;</b> psi '+lo.toFixed(0)+'&ndash;'+hi.toFixed(0)+
+    ' &nbsp; <span style="opacity:.6">&#9473;</span> Hz 0&ndash;60';
+  $('tnow').innerHTML='<span style="color:#96ebc8">&#9476;</span> gpm 0&ndash;'+qhi.toFixed(0)+
+    ' &nbsp; '+n+'s';
 }
 
 // ---- setpoint ------------------------------------------------------------
@@ -195,11 +204,12 @@ async function tick(){
   else if(j.state==7){txt='Fault — check the drives above';cls='bad';}
   else if(j.ovr){txt='Max-Hz override engaged at '+j.ovrPct+'% — cap bypassed';cls='warn';}
   else if(j.addr1){txt='Uncommissioned drive answering at address 1';cls='warn';}
-  else if(!j.enable){txt='Stopped — press Enable to run';cls='ok';}
+  else if(!j.enable){txt=j.sim?'Simulation ready — press Enable to start the pump'
+                            :'Stopped — press Enable to run';cls='ok';}
   else txt='Enabled — holding '+j.spActive.toFixed(1)+' psi';
   $('banner').textContent=txt;$('banner').className='alert '+cls;
 
-  if(j.psiValid){hist.push([j.psi,j.hzCmd]);if(hist.length>150)hist.shift();}
+  if(j.psiValid){hist.push([j.psi,j.hzCmd,j.flow]);if(hist.length>150)hist.shift();}
   trendDraw(spSet||j.spActive);
 }
 

@@ -33,7 +33,7 @@
 // field can always be matched to a commit.  See VERSION.md for the log.
 // This block must stay ABOVE FW_VERSION_STR below -- that initialiser expands
 // the macro, so defining it afterwards does not compile.
-#define FW_VERSION "0.11.0"
+#define FW_VERSION "0.12.0"
 
 // net.h needs the version string at runtime; the macro is not visible to it.
 const char *FW_VERSION_STR = FW_VERSION;
@@ -582,13 +582,16 @@ void setupWeb() {
       if (S.simOn)
         for (int i = 0; i < MAX_DRIVES; i++)
           if (drv[i].present) commandDrive(drv[i], false, 0, false);
-      applySimDrives();
       pc.reset();
       plant.psi = 0;
       // Leaving simulation, the drive list is whatever discovery finds, not
       // whatever the sim was pretending to have.
-      if (!S.simOn) { lastLog = discover(); }
+      if (!S.simOn) lastLog = discover();
     }
+    // Unconditional while simulating, not just on the on/off edge: changing
+    // the pump count from 2 to 1 has to take effect now, and gating this on
+    // the edge meant a count change did nothing until the next reboot.
+    if (S.simOn) applySimDrives();
 
     S.simMode      = (int)limitf(0, argF(r, "simMode", S.simMode), 1);
     S.simPsi       = limitf(0, argF(r, "simPsi", S.simPsi), 300);

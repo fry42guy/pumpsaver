@@ -92,24 +92,9 @@ const char PAGE_PUMP[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset
 </section>
 
 <section id="simsec" style="display:none"><h2>Simulated plant</h2>
-<div class="fld wide"><span class="k">Drive by</span>
-<select id="sm"><option value="0">Demand &mdash; plant finds its own pressure</option>
-<option value="1">Pressure &mdash; hold the header where I put it</option></select></div>
-<div id="psirow">
-<div class="sl"><div class="lab"><span>Header psi</span></div>
-<input type="range" id="sp2" min="0" max="90" step="0.5"><input type="number" id="sp2v" step="0.5"></div>
-<div class="rng">range<input type="number" id="sp2min" value="0"><span>to</span><input type="number" id="sp2max" value="90"></div>
-</div>
-<div class="sl"><div class="lab"><span>Demand gpm</span></div>
-<input type="range" id="sd" min="0" max="120" step="0.5"><input type="number" id="sdv" step="0.5"></div>
-<div class="rng">range<input type="number" id="sdmin" value="0"><span>to</span><input type="number" id="sdmax" value="120"></div>
-<div class="sl"><div class="lab"><span>Time scale &times;</span></div>
-<input type="range" id="ts" min="1" max="60" step="1"><input type="number" id="tsv" step="1"></div>
-<div class="rng">range<input type="number" id="tsmin" value="1"><span>to</span><input type="number" id="tsmax" value="60"></div>
-<div class="sl"><div class="lab"><span>Tank gal/psi</span></div>
-<input type="range" id="cg" min="0.2" max="10" step="0.1"><input type="number" id="cgv" step="0.1"></div>
-<div class="rng">range<input type="number" id="cgmin" value="0.2"><span>to</span><input type="number" id="cgmax" value="10"></div>
-<div class="note">Flow <b id="fl">--</b> gpm &middot; actual <b id="ha">--</b> Hz</div>
+<p class="note" style="margin-top:0">Switch simulation on and off, and pick 1 or 2 pumps,
+on <a href="/system">System</a>.</p>
+)HTML" SIM_PANEL_HTML R"HTML(
 </section>
 
 <form id="f" onsubmit="return save()">
@@ -320,7 +305,7 @@ async function tick(){
 
   if(SET){if(j.state!=0&&j.psiValid){trail.push([j.psi,j.hzCmd]);if(trail.length>300)trail.shift();}
           drawGraph(j,SET);}
-  if(j.sim){$('fl').textContent=j.flow.toFixed(1);$('ha').textContent=j.hzAct.toFixed(1);}
+  if(j.sim)simTick(j);
   drawDiag(await(await fetch('/diag')).json());
 }
 
@@ -340,10 +325,7 @@ async function loadS(){const j=await(await fetch('/settings')).json();SET=j;
  for(let i=0;i<4;i++){f.elements['cp'+i].value=j.capPsi[i];f.elements['ch'+i].value=j.capHz[i];}
  $('captab').innerHTML=j.capTableOK?'Table valid.':
    '<b class="no">Cap table not monotonic (or row 1 below Min Hz) — cap is parked at row 1.</b>';
- $('sd').value=j.simDemandGPM;$('ts').value=j.simTimeScale;$('cg').value=j.simCapGalPsi;
- $('sm').value=j.simMode;$('sp2').value=j.simPsi;
- $('qsp').value=Math.round(j.setpoint);$('qspv').value=Math.round(j.setpoint);
- simEcho();}
+ $('qsp').value=Math.round(j.setpoint);$('qspv').value=Math.round(j.setpoint);}
 
 async function save(){toast(await post('/set',formBody(f)));trail=[];await loadS();return false;}
 async function sendCmd(c){toast(await(await fetch('/cmd?c='+c,{method:'POST'})).text());}
@@ -367,27 +349,9 @@ $('ovs').addEventListener('change',ovPush);
 $('ovsv').addEventListener('change',()=>{$('ovs').value=$('ovsv').value;ovEcho();ovPush();});
 $('ovon').addEventListener('change',ovPush);
 
-// ---- sim sliders ---------------------------------------------------------
-let simT=null;
-function simEcho(){$('sdv').value=$('sd').value;$('tsv').value=$('ts').value;
- $('cgv').value=$('cg').value;$('sp2v').value=$('sp2').value;
- $('psirow').style.display=($('sm').value=='1')?'block':'none';}
-function simDrag(){simEcho();clearTimeout(simT);simT=setTimeout(pushSim,150);}
-function simDrop(){simEcho();clearTimeout(simT);pushSim();}
-function simBox(){$('sd').value=$('sdv').value;$('ts').value=$('tsv').value;
- $('cg').value=$('cgv').value;$('sp2').value=$('sp2v').value;simDrop();}
-function simRange(){$('sd').min=$('sdmin').value;$('sd').max=$('sdmax').value;
- $('ts').min=$('tsmin').value;$('ts').max=$('tsmax').value;
- $('cg').min=$('cgmin').value;$('cg').max=$('cgmax').value;
- $('sp2').min=$('sp2min').value;$('sp2').max=$('sp2max').value;simEcho();}
-async function pushSim(){await post('/sim',{simMode:$('sm').value,simPsi:$('sp2').value,
- simDemandGPM:$('sd').value,simTimeScale:$('ts').value,simCapGalPsi:$('cg').value});}
-for(const id of ['sd','ts','cg','sp2']){
-  $(id).addEventListener('input',simDrag);$(id).addEventListener('change',simDrop);}
-for(const id of ['sdv','tsv','cgv','sp2v'])$(id).addEventListener('change',simBox);
-for(const id of ['sdmin','sdmax','tsmin','tsmax','cgmin','cgmax','sp2min','sp2max'])
-  $(id).addEventListener('change',simRange);
-$('sm').addEventListener('change',simDrop);
+// ---- simulated plant (shared with System) ---------------------------------
+)HTML" SIM_PANEL_JS R"HTML(
 
-loadS();tick();setInterval(tick,1000);
+
+loadS();simLoad();tick();setInterval(tick,1000);
 </script></body></html>)HTML";
