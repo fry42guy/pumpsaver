@@ -187,7 +187,7 @@ details[open] summary:before{transform:rotate(90deg)}
     <span class="meta"><span id="devname">&nbsp;</span><br><span id="ver">&nbsp;</span></span>
   </div>
   <nav>
-    <a href="/">Home</a><a href="/pump">Pump</a><a href="/sim">Sim</a><a href="/network">Network</a><a href="/system">System</a>
+    <a href="/">Home</a><a href="/pump">Pump</a><a href="/cal">Calibrate</a><a href="/sim">Sim</a><a href="/network">Network</a><a href="/system">System</a>
   </nav>
 </div>
 <div class="banner sim" id="simbar" style="display:none">SIMULATED PLANT &mdash; NOT DRIVING REAL HARDWARE</div>

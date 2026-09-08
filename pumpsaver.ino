@@ -33,7 +33,7 @@
 // field can always be matched to a commit.  See VERSION.md for the log.
 // This block must stay ABOVE FW_VERSION_STR below -- that initialiser expands
 // the macro, so defining it afterwards does not compile.
-#define FW_VERSION "0.14.0"
+#define FW_VERSION "0.20.0"
 
 // net.h needs the version string at runtime; the macro is not visible to it.
 const char *FW_VERSION_STR = FW_VERSION;
@@ -64,6 +64,20 @@ const char *FW_VERSION_STR = FW_VERSION;
 #endif
 #ifndef SIM
 #define SIM 0
+#endif
+
+// USB CDC On Boot must be Enabled.  With it off, HardwareSerial.h binds Serial
+// to UART0 instead of HWCDCSerial/USBSerial, and the failure that surfaces is
+// "'class HardwareSerial' has no member named 'setTxTimeoutMs'" -- which says
+// nothing about the actual cause.  Worse than the error is the build that
+// would succeed if that call were removed: the console, the CSV log and the
+// upload port all move to UART0 pins, so a board that flashes cleanly comes up
+// mute on USB.  Fail here, with instructions, instead.
+//
+// .\build.ps1 passes the whole FQBN and is immune to this; it only bites when
+// building from the IDE with the board menu set differently.
+#if !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT
+#error "Set Tools > USB CDC On Boot = Enabled (also Flash Size 16MB, PSRAM OPI). Or build with .\\build.ps1, which pins the FQBN."
 #endif
 
 // AP SSID and password are no longer compiled in -- they live in NetCfg (net.h,
@@ -185,6 +199,14 @@ struct Drive {
   // exactly like a working one.
   bool     writeOK = false;
   uint32_t writeFails = 0;
+  uint16_t cmdW = 0, refRaw = 0;   // registers 1 and 2 read back from the drive
+  // From the E3 manual's register map (see MODBUS_E3.md).  These were guessed
+  // at from adjacent registers until the real map turned up; they are named
+  // for what they are now.
+  uint16_t volts = 0;      // reg 2014, motor output voltage, 0-500 V
+  uint16_t vbus  = 0;      // reg 23,   DC bus voltage,        0-1000 V
+  int16_t  torq  = 0;      // reg 2006, motor torque,  0.1 % signed, +/-200.0
+  uint16_t powkW = 0;      // reg 2004, motor power,   kW x10
 
   // ---- registers beyond the status triplet, carried so the UI can show what
   // the drive actually reports rather than what we inferred.
@@ -288,6 +310,19 @@ bool     gLockout = false;       // local inhibit, survives nothing either
 // cap enforcing again rather than silently still overridden.
 bool     gOvr     = false;
 float    gOvrPct  = 100.0f;      // 0-100 %, of 60 Hz
+
+// Manual speed mode.  Not persisted, for the same reason gEnable is not: it
+// hands the pump straight to a slider with no cap and no pressure loop behind
+// it, so a reboot must always come back in automatic.
+bool     gMan     = false;
+float    gManHz   = 0.0f;
+
+// Bench bus hold.  While set, the control tick reads drives but writes nothing
+// to them, so a register written by hand from the console survives longer than
+// the 100 ms until the next commandDrive().  Not persisted: this is a probe,
+// not a mode.  Holding the bus means the drive stops hearing from us, so its
+// own P-36 watchdog will trip a RUNNING drive -- which is the safe direction.
+bool     gBusHold = false;
 uint32_t gCmdReset = 0;
 uint32_t gRebootAt = 0;          // set by /reboot; 0 = no restart pending
 uint32_t lastTick = 0, tickN = 0;
@@ -385,7 +420,26 @@ void pollDrive(Drive &d) {
     if ((d.fails == 0) && (tickN % (STATUS_EVERY * 4) == 0)) {
       if (rtu.readHolding(d.addr, REG(24), 1, &x) && x <= 150) d.tempC = x;
       if (rtu.readHolding(d.addr, REG(20), 1, &x) && x <= 1000) d.aiCounts = x;
+      // Separate reads, NOT folded into the status read above: if the drive
+      // rejected a wider block the status/Hz/amps read would fail with it, and
+      // losing the control feedback to collect a diagnostic would be a bad
+      // trade.  These are allowed to fail on their own.
+      if (rtu.readHolding(d.addr, REG(23), 1, &x) && x <= 1000) d.vbus = x;
+      uint16_t b[3];
+      // 2004 power, 2005 IO status, 2006 torque -- one transaction for two of
+      // the three.  Torque is the interesting one: DESIGN_NOTES calls it the
+      // best available flow proxy because, unlike current, it carries no
+      // magnetising offset.
+      if (rtu.readHolding(d.addr, REG(2004), 3, b)) { d.powkW = b[0]; d.torq = (int16_t)b[2]; }
+      if (rtu.readHolding(d.addr, REG(2014), 1, &x) && x <= 500) d.volts = x;
     }
+    // Read our own command registers BACK from the drive.  "What we believe we
+    // sent" and "what the drive is holding" are different facts, and the whole
+    // 4.5-commanded / 54-running puzzle lives in the gap between them.  A
+    // command echo is not a measurement of the motor -- reg 7 is that -- so
+    // these are reported as what they are and never substituted for it.
+    uint16_t e[2];
+    if (rtu.readHolding(d.addr, REG(1), 2, e)) { d.cmdW = e[0]; d.refRaw = e[1]; }
   } else if (++d.fails >= 3) {
     d.commsOK = false;
   }
@@ -399,6 +453,7 @@ void commandDrive(Drive &d, bool run, float hz, bool reset) {
   // down. Declared here rather than at the call site because every path
   // that commands a drive goes through this function.
   if (gwOwnsDrive()) return;
+  if (gBusHold) return;            // bench probe in progress -- see gBusHold
   uint16_t w[2];
   w[0] = (run ? 1 : 0) | (reset ? 4 : 0);
   w[1] = (uint16_t)(limitf(0, hz, 60.0f) * 10.0f + 0.5f);
@@ -452,6 +507,7 @@ String statusJSON() {
   j += ",\"capHz\":" + String(pout.capHz, 1) + ",\"shutoffHz\":" + String(pout.shutoffHz, 1);
   j += ",\"state\":" + String(pout.state) + ",\"enable\":" + String(gEnable ? "true" : "false");
   j += ",\"ovr\":" + String(gOvr ? "true" : "false") + ",\"ovrPct\":" + String(gOvrPct, 0);
+  j += ",\"man\":" + String(gMan ? "true" : "false") + ",\"manHz\":" + String(gManHz, 1);
   j += ",\"sleepCycles\":" + String(pc.sleepCycles);
   // Controller uptime, not the browser's -- a reader has to be able to tell
   // that the board rebooted under them.  Seconds since boot.
@@ -467,6 +523,7 @@ String statusJSON() {
     j += ",\"commsOK\":" + String(drv[i].commsOK ? "true" : "false");
     j += ",\"writeOK\":" + String(drv[i].writeOK ? "true" : "false");
     j += ",\"writeFails\":" + String(drv[i].writeFails);
+    j += ",\"cmdW\":" + String(drv[i].cmdW) + ",\"refRaw\":" + String(drv[i].refRaw);
     j += ",\"hz\":" + String(drv[i].hz, 1) + ",\"amps\":" + String(drv[i].amps, 1);
     j += ",\"running\":" + String(drv[i].running ? "true" : "false");
     j += ",\"tripped\":" + String(drv[i].tripped ? "true" : "false");
@@ -594,12 +651,201 @@ void sendNoCache(AsyncWebServerRequest *r, int code, const char *type, const Str
   r->send(res);
 }
 
+// ---------------------------------------------------------------- pump sweep
+/*
+  Curve capture.  Step the pump through fixed speeds and record what the drive
+  reports at each one.  Run it once deadheaded and once wide open and the pair
+  characterises the pump: the deadhead run MEASURES shutoff head against speed,
+  which is where shutoffPsiAt60 and the cap table ought to come from instead of
+  being estimated -- 84 psi is currently a guess that nothing has ever checked.
+
+  It drives the pump through MANUAL mode rather than opening a second speed
+  path, so this firmware still has exactly one route that bypasses the PI loop.
+
+  Aborts: pressure over gSwPsiMax, drive trip, loss of comms.  The last two are
+  not safety padding -- a step cannot be recorded from a drive that is not
+  answering, so carrying on would only log fiction.
+*/
+#define SWEEP_STEPS 7
+#define SWEEP_AVG_MS    2000          // average the settled tail of each step
+#define SWEEP_HOLD_MAX_MS 600000UL    // 10 min ceiling on a held step
+static const float SWEEP_HZ[SWEEP_STEPS] = { 30, 35, 40, 45, 50, 55, 60 };
+
+struct SweepRow {
+  bool     done  = false;
+  float    hzSet = 0, hzAct = 0, psi = 0, amps = 0;
+  float    flow  = 0;                 // typed in by hand on the open run
+  bool     cav   = false;             // operator heard it cavitating
+  uint16_t ai    = 0;
+  uint16_t volts = 0, vbus = 0, powkW = 0;
+  int16_t  torq  = 0;
+  int      tempC = 0;
+};
+SweepRow gSwRow[2][SWEEP_STEPS];      // [0] deadhead, [1] wide open
+bool     gSwRun    = false;
+int      gSwMode   = 0;
+int      gSwStep   = 0;
+uint32_t gSwT0     = 0;
+float    gSwPsiMax = 120.0f;
+uint32_t gSwDwellMs = 10000;          // operator adjustable
+bool     gSwStepMode = false;         // true = hold each step until "next"
+bool     gSwHold   = false;           // holding at speed, waiting for "next"
+uint32_t gSwHoldT0 = 0;
+String   gSwMsg    = "idle";
+float    gSwAccPsi = 0, gSwAccHz = 0, gSwAccA = 0;
+int      gSwAccN   = 0;
+
+void sweepStop(const String &why) {
+  gSwRun  = false;
+  gSwHold = false;
+  gSwMsg  = why;
+  gManHz  = 0;
+  gEnable = false;
+  gMan    = false;                    // back to automatic, stopped
+}
+
+void sweepStart(int mode) {
+  gSwMode = (mode > 0) ? 1 : 0;
+  for (int i = 0; i < SWEEP_STEPS; i++) gSwRow[gSwMode][i] = SweepRow();
+  gSwStep = 0; gSwAccN = 0; gSwAccPsi = gSwAccHz = gSwAccA = 0;
+  gSwHold = false;
+  gMan = true; gManHz = SWEEP_HZ[0]; gEnable = true;
+  gSwT0 = millis(); gSwRun = true;
+  gSwMsg = "running";
+}
+
+// Capture the current step, then either advance or hold for the operator.
+static void sweepCapture() {
+  Drive &d = drv[0];
+  SweepRow &r = gSwRow[gSwMode][gSwStep];
+  r.hzSet = SWEEP_HZ[gSwStep];
+  if (gSwAccN) { r.psi = gSwAccPsi / gSwAccN; r.hzAct = gSwAccHz / gSwAccN;
+                 r.amps = gSwAccA / gSwAccN; }
+  r.ai = d.aiCounts; r.tempC = d.tempC;
+  r.volts = d.volts; r.vbus = d.vbus; r.torq = d.torq; r.powkW = d.powkW;
+  r.done = true;
+  gSwAccPsi = gSwAccHz = gSwAccA = 0; gSwAccN = 0;
+}
+
+static void sweepAdvance() {
+  gSwHold = false;
+  if (++gSwStep >= SWEEP_STEPS) { sweepStop("complete"); return; }
+  gSwT0  = millis();
+  gManHz = SWEEP_HZ[gSwStep];
+}
+
+void sweepNext() {
+  if (!gSwRun || !gSwHold) return;
+  sweepAdvance();
+}
+
+void sweepTick() {
+  if (!gSwRun) return;
+  Drive &d = drv[0];
+  if (!d.present || !d.commsOK) { sweepStop("aborted - no comms with the drive"); return; }
+  if (d.tripped)                { sweepStop("aborted - drive tripped"); return; }
+  if (gPsiValid && pin_.psi > gSwPsiMax) {
+    sweepStop("ABORTED at " + String(pin_.psi, 1) + " psi, over the "
+              + String(gSwPsiMax, 0) + " psi limit");
+    return;
+  }
+
+  // Holding at speed for the operator: the pump stays at this step's Hz so a
+  // flow meter can actually be read at it.  Bounded, because a held deadhead
+  // step would otherwise run until somebody came back to the bench.
+  if (gSwHold) {
+    if (millis() - gSwHoldT0 > SWEEP_HOLD_MAX_MS)
+      sweepStop("aborted - held at one step for 10 minutes");
+    return;
+  }
+
+  uint32_t dwell = gSwDwellMs;
+  uint32_t avg   = (dwell > SWEEP_AVG_MS * 2) ? SWEEP_AVG_MS : dwell / 2;
+  uint32_t el    = millis() - gSwT0;
+  if (el >= dwell - avg) {                        // settled tail only
+    gSwAccPsi += pin_.psi; gSwAccHz += d.hz; gSwAccA += d.amps; gSwAccN++;
+  }
+  if (el < dwell) return;
+
+  sweepCapture();
+  if (gSwStepMode) { gSwHold = true; gSwHoldT0 = millis(); return; }
+  sweepAdvance();
+}
+
+String sweepJSON() {
+  String j = "{\"run\":" + String(gSwRun ? "true" : "false");
+  j += ",\"mode\":" + String(gSwMode) + ",\"step\":" + String(gSwStep);
+  j += ",\"steps\":" + String(SWEEP_STEPS);
+  j += ",\"psiMax\":" + String(gSwPsiMax, 0);
+  j += ",\"dwell\":" + String(gSwDwellMs / 1000);
+  j += ",\"stepMode\":" + String(gSwStepMode ? "true" : "false");
+  j += ",\"hold\":" + String(gSwHold ? "true" : "false");
+  j += ",\"holdHz\":" + String(gSwRun ? SWEEP_HZ[gSwStep] : 0, 0);
+  j += ",\"secLeft\":" + String((gSwRun && !gSwHold)
+        ? (int)((gSwDwellMs - (millis() - gSwT0)) / 1000) : 0);
+  j += ",\"msg\":\"" + gSwMsg + "\",\"rows\":[";
+  for (int m = 0; m < 2; m++) {
+    if (m) j += ",";
+    j += "[";
+    for (int i = 0; i < SWEEP_STEPS; i++) {
+      if (i) j += ",";
+      SweepRow &r = gSwRow[m][i];
+      j += "{\"done\":" + String(r.done ? "true" : "false");
+      j += ",\"hz\":" + String(SWEEP_HZ[i], 0) + ",\"hzAct\":" + String(r.hzAct, 1);
+      j += ",\"psi\":" + String(r.psi, 1) + ",\"amps\":" + String(r.amps, 2);
+      j += ",\"ai\":" + String(r.ai) + ",\"tempC\":" + String(r.tempC);
+      j += ",\"volts\":" + String(r.volts) + ",\"vbus\":" + String(r.vbus);
+      j += ",\"torq\":" + String(r.torq / 10.0f, 1) + ",\"kw\":" + String(r.powkW / 10.0f, 1);
+      j += ",\"cav\":" + String(r.cav ? "true" : "false");
+      j += ",\"flow\":" + String(r.flow, 1) + "}";
+    }
+    j += "]";
+  }
+  return j + "]}";
+}
+
+// Switching simulation is a safety operation, not a flag flip, so it lives in
+// one function shared by the web handler and the serial console -- the same
+// reason cfgClamp() is shared by /set and import.  S.simDrives must already be
+// set when this is called, because applySimDrives() reads it.
+void simSwitch(bool want) {
+  bool wasSim = S.simOn;
+  S.simOn = want;
+  if (S.simOn != wasSim) {
+    // Entering simulation, the loop stops feeding real pressure to the
+    // controller -- so it must also stop commanding real pumps.  Drop the
+    // run demand and write stop/0 Hz to anything actually on the bus before
+    // switching, rather than going silent and leaving the drive's P-36
+    // watchdog to trip it.  A trip would stop the pump too, but it would
+    // stop it as a FAULT that somebody then has to go and reset.
+    gEnable = false;
+    if (S.simOn)
+      for (int i = 0; i < MAX_DRIVES; i++)
+        if (drv[i].present) commandDrive(drv[i], false, 0, false);
+    pc.reset();
+    plant.psi = 0;
+    // Leaving simulation, the drive list is whatever discovery finds, not
+    // whatever the sim was pretending to have.
+    if (!S.simOn) lastLog = discover();
+  }
+  // Unconditional while simulating, not just on the on/off edge: changing
+  // the pump count from 2 to 1 has to take effect now, and gating this on
+  // the edge meant a count change did nothing until the next reboot.
+  if (S.simOn) applySimDrives();
+}
+
 void setupWeb() {
-  server.on("/",        HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_HOME); });
-  server.on("/pump",    HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_PUMP); });
-  server.on("/sim",     HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_SIM); });
-  server.on("/network", HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_NET); });
-  server.on("/system",  HTTP_GET, [](AsyncWebServerRequest *r) { r->send(200, "text/html", PAGE_SYSTEM); });
+  // send_P streams the page straight out of flash.  Plain send() with a
+  // const char* binds to the const String& overload, which copies the WHOLE
+  // page onto the heap first -- one contiguous block.  That is survivable for
+  // a 20 KB page and not for the 40 KB Pump page once WiFi and AsyncTCP have
+  // fragmented the heap, which is why /pump alone would not load.
+  server.on("/",        HTTP_GET, [](AsyncWebServerRequest *r) { r->send_P(200, "text/html", PAGE_HOME); });
+  server.on("/pump",    HTTP_GET, [](AsyncWebServerRequest *r) { r->send_P(200, "text/html", PAGE_PUMP); });
+  server.on("/cal",     HTTP_GET, [](AsyncWebServerRequest *r) { r->send_P(200, "text/html", PAGE_CAL); });
+  server.on("/sim",     HTTP_GET, [](AsyncWebServerRequest *r) { r->send_P(200, "text/html", PAGE_SIM); });
+  server.on("/network", HTTP_GET, [](AsyncWebServerRequest *r) { r->send_P(200, "text/html", PAGE_NET); });
+  server.on("/system",  HTTP_GET, [](AsyncWebServerRequest *r) { r->send_P(200, "text/html", PAGE_SYSTEM); });
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *r) { sendNoCache(r, 200, "application/json", statusJSON()); });
   server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *r) { sendNoCache(r, 200, "application/json", settingsJSON()); });
   server.on("/diag", HTTP_GET, [](AsyncWebServerRequest *r) { sendNoCache(r, 200, "application/json", diagJSON()); });
@@ -663,31 +909,10 @@ void setupWeb() {
   });
 
   server.on("/sim", HTTP_POST, [](AsyncWebServerRequest *r) {
-    bool wasSim = S.simOn;
-    if (r->hasParam("on", true)) S.simOn = argF(r, "on", S.simOn ? 1 : 0) > 0.5f;
+    bool want = S.simOn;
+    if (r->hasParam("on", true)) want = argF(r, "on", S.simOn ? 1 : 0) > 0.5f;
     S.simDrives = (int)limitf(1, argF(r, "drives", S.simDrives), MAX_DRIVES);
-
-    if (S.simOn != wasSim) {
-      // Entering simulation, the loop stops feeding real pressure to the
-      // controller -- so it must also stop commanding real pumps.  Drop the
-      // run demand and write stop/0 Hz to anything actually on the bus before
-      // switching, rather than going silent and leaving the drive's P-36
-      // watchdog to trip it.  A trip would stop the pump too, but it would
-      // stop it as a FAULT that somebody then has to go and reset.
-      gEnable = false;
-      if (S.simOn)
-        for (int i = 0; i < MAX_DRIVES; i++)
-          if (drv[i].present) commandDrive(drv[i], false, 0, false);
-      pc.reset();
-      plant.psi = 0;
-      // Leaving simulation, the drive list is whatever discovery finds, not
-      // whatever the sim was pretending to have.
-      if (!S.simOn) lastLog = discover();
-    }
-    // Unconditional while simulating, not just on the on/off edge: changing
-    // the pump count from 2 to 1 has to take effect now, and gating this on
-    // the edge meant a count change did nothing until the next reboot.
-    if (S.simOn) applySimDrives();
+    simSwitch(want);
 
     S.simMode      = (int)limitf(0, argF(r, "simMode", S.simMode), 1);
     S.simPsi       = limitf(0, argF(r, "simPsi", S.simPsi), 300);
@@ -720,6 +945,83 @@ void setupWeb() {
       else { lastLog = discover(); sendNoCache(r, 200, "text/plain", lastLog); }
     }
     else r->send(400, "text/plain", "unknown cmd");
+  });
+
+  // Manual speed.  Nothing here is written to NVS -- see gMan.  Leaving manual
+  // drops the run demand: coming back to automatic with the pump still turning
+  // would hand a live pump to a PI loop whose integrator was last set by hand.
+  server.on("/man", HTTP_POST, [](AsyncWebServerRequest *r) {
+    if (r->hasParam("hz", true))
+      gManHz = limitf(0, r->getParam("hz", true)->value().toFloat(), 60);
+    if (r->hasParam("on", true)) {
+      bool want = r->getParam("on", true)->value() == "1";
+      if (want != gMan) gEnable = false;
+      gMan = want;
+    }
+    sendNoCache(r, 200, "application/json",
+                String("{\"man\":") + (gMan ? "true" : "false") +
+                ",\"manHz\":" + String(gManHz, 1) +
+                ",\"enable\":" + (gEnable ? "true" : "false") + "}");
+  });
+
+  // ---- pump sweep ----------------------------------------------------
+  server.on("/sweep", HTTP_GET, [](AsyncWebServerRequest *r) {
+    sendNoCache(r, 200, "application/json", sweepJSON());
+  });
+  server.on("/sweep", HTTP_POST, [](AsyncWebServerRequest *r) {
+    String a = r->hasParam("a", true) ? r->getParam("a", true)->value() : "";
+    if (r->hasParam("psiMax", true))
+      gSwPsiMax = limitf(10, r->getParam("psiMax", true)->value().toFloat(), 300);
+    if (r->hasParam("dwell", true))
+      gSwDwellMs = (uint32_t)(limitf(2, r->getParam("dwell", true)->value().toFloat(), 300) * 1000);
+    if (r->hasParam("stepMode", true))
+      gSwStepMode = r->getParam("stepMode", true)->value() == "1";
+    if (a == "next") { sweepNext(); sendNoCache(r, 200, "application/json", sweepJSON()); return; }
+    if (a == "cav") {
+      int m = r->hasParam("mode", true) ? r->getParam("mode", true)->value().toInt() : 1;
+      int s = r->hasParam("step", true) ? r->getParam("step", true)->value().toInt() : -1;
+      bool on = r->hasParam("on", true) && r->getParam("on", true)->value() == "1";
+      if (m >= 0 && m < 2 && s >= 0 && s < SWEEP_STEPS) gSwRow[m][s].cav = on;
+      sendNoCache(r, 200, "application/json", sweepJSON());
+      return;
+    }
+    if (a == "start") {
+      if (S.simOn)          { sendNoCache(r, 409, "text/plain", "Simulation is on -- no real pump to profile."); return; }
+      if (!drv[0].present)  { sendNoCache(r, 409, "text/plain", "No drive on the bus."); return; }
+      if (drv[0].tripped)   { sendNoCache(r, 409, "text/plain", "Drive is tripped -- fault reset first."); return; }
+      sweepStart(r->hasParam("mode", true) ? r->getParam("mode", true)->value().toInt() : 0);
+    } else if (a == "abort") {
+      sweepStop("aborted by operator");
+    } else if (a == "flow") {
+      // Flow is typed in by hand on the wide-open run: it is an OPERATOR
+      // reading off a meter, not something this board measured, and it is
+      // exported labelled as such.
+      int m = r->hasParam("mode", true) ? r->getParam("mode", true)->value().toInt() : 1;
+      int s = r->hasParam("step", true) ? r->getParam("step", true)->value().toInt() : -1;
+      float g = r->hasParam("gpm", true) ? r->getParam("gpm", true)->value().toFloat() : 0;
+      if (m >= 0 && m < 2 && s >= 0 && s < SWEEP_STEPS) gSwRow[m][s].flow = limitf(0, g, 10000);
+    }
+    sendNoCache(r, 200, "application/json", sweepJSON());
+  });
+  server.on("/sweepcsv", HTTP_GET, [](AsyncWebServerRequest *r) {
+    String c = "mode,hz_set,hz_actual,psi,amps,motor_volts,dc_bus_v,torque_pct,"
+               "power_kw,ai_counts,heatsink_c,flow_gpm_manual,cavitating_manual\n";
+    for (int m = 0; m < 2; m++)
+      for (int i = 0; i < SWEEP_STEPS; i++) {
+        SweepRow &w = gSwRow[m][i];
+        if (!w.done) continue;
+        c += String(m ? "open" : "deadhead") + "," + String(SWEEP_HZ[i], 0) + ","
+           + String(w.hzAct, 1) + "," + String(w.psi, 1) + "," + String(w.amps, 2) + ","
+           + String(w.volts) + "," + String(w.vbus) + ","
+           + String(w.torq / 10.0f, 1) + "," + String(w.powkW / 10.0f, 1) + ","
+           + String(w.ai) + "," + String(w.tempC) + ","
+           + String(w.flow, 1) + "," + String(w.cav ? "yes" : "no") + "\n";
+      }
+    AsyncWebServerResponse *res = r->beginResponse(200, "text/csv", c);
+    res->addHeader("Content-Disposition",
+                   String("attachment; filename=\"pumpsweep-") + gDevId + ".csv\"");
+    res->addHeader("Cache-Control", "no-store");
+    r->send(res);
   });
 
   // Diagnostic max-Hz override.  Nothing here is written to NVS -- see gOvr.
@@ -964,6 +1266,262 @@ void setupWeb() {
   server.begin();
 }
 
+// ---------------------------------------------------------------- bench console
+/*
+  A command line on the USB serial port.
+
+  The web UI is the real interface, but it lives on the board's own AP, and a
+  bench machine with a single radio cannot join that AP without giving up the
+  network it is already using.  That has blocked hardware work two sessions
+  running.  It is worse in the field than on the bench: when the configured
+  station SSID is out of range the station side retries forever and the softAP
+  follows it around the channels, so the AP is hardest to join exactly when it
+  is the only way in.  `sta clear` is the way out of that without a laptop that
+  can reach the page.
+
+  Reads are non-blocking -- only bytes already buffered are consumed -- for the
+  same reason Serial.setTxTimeoutMs(0) exists.  Nothing here may stall the tick.
+*/
+static String gConLine;
+bool gCsvOn = true;                 // per-tick CSV stream; mute it while typing
+
+static void conHelp() {
+  Serial.println(F(
+    "commands\n"
+    "  help                this list\n"
+    "  status              firmware, mode, override, drives\n"
+    "  log on|off          per-tick CSV stream\n"
+    "  sim on|off          runtime simulation\n"
+    "  scan                rescan the Modbus bus\n"
+    "  regs [addr]         raw holding registers from a drive\n"
+    "  heap                free heap, largest block, page sizes\n"
+    "  hold on|off         stop the control tick writing, for a raw probe\n"
+    "  rd <addr> <reg> [n] read holding registers\n"
+    "  wr <addr> <reg> <v> write one register (needs hold on)\n"
+    "  man off | <hz>      MANUAL speed, 0-60 Hz, PI and cap bypassed\n"
+    "  ovr off | <pct>     max-Hz override, 0-100 %\n"
+    "  hz <hz>             the same override, expressed in Hz\n"
+    "  run | stop          enable / disable the pump loop\n"
+    "  reset               clear a drive trip (a reflash trips the watchdog)\n"
+    "  sweep dead|open     curve capture, 30-60 Hz in 5 Hz steps\n"
+    "  sweep next | abort | show\n"
+    "  sta clear           blank the station SSID, then reboot\n"
+    "  reboot"));
+}
+
+static void conStatus() {
+  Serial.printf("fw %s   sim %s   enable %s   bus hold %s   state %d\n",
+                FW_VERSION, S.simOn ? "ON" : "off", gEnable ? "ON" : "off",
+                gBusHold ? "ON" : "off", pout.state);
+  Serial.printf("manual %s at %.1f Hz   override %s at %.0f%% = %.1f Hz ceiling\n",
+                gMan ? "ON" : "off", gManHz,
+                gOvr ? "ENGAGED" : "off", gOvrPct, gOvrPct * 0.6f);
+  Serial.printf("psi %.1f (valid %s)   hzCmd %.1f   cap %.1f   shutoff %.1f\n",
+                pin_.psi, gPsiValid ? "yes" : "NO", pout.hzCmd, pout.capHz, pout.shutoffHz);
+  for (int i = 0; i < MAX_DRIVES; i++) {
+    Drive &d = drv[i];
+    Serial.printf("drive %d  addr %-2u  present %-3s comms %-3s write %-3s  "
+                  "%5.1f Hz  %5.1f A  st 0x%04X%s\n",
+                  i + 1, d.addr, d.present ? "yes" : "no", d.commsOK ? "yes" : "no",
+                  d.writeOK ? "yes" : "no", d.hz, d.amps, d.status,
+                  d.tripped ? "   TRIPPED" : "");
+    if (d.tripped) Serial.printf("         trip code %u (0x%02X) -- 'reset' to clear\n",
+                                 d.tripCode, d.tripCode);
+    if (d.present)
+      Serial.printf("         echo: reg1 0x%04X   reg2 %u = %.1f Hz   vs out %.1f Hz\n",
+                    d.cmdW, d.refRaw, d.refRaw / 10.0f, d.hz);
+  }
+}
+
+// Raw register dump.  Deliberately prints what came back rather than anything
+// derived from it: this is the tool you reach for when you do not yet trust
+// the addressing, and a decoded value would hide a wrong-slave answer.
+static void conRegs(uint8_t addr) {
+  if (S.simOn) { Serial.println("simulation is on -- there is no bus to read"); return; }
+  static const uint16_t want[] = { 1, 2, 6, 7, 8, 20, 24 };
+  static const char *what[]    = { "command word", "speed ref x10", "status word",
+                                   "output Hz x10", "current A x10",
+                                   "AI1 counts 0-1000", "heatsink C" };
+  const uint8_t N = sizeof(want) / sizeof(want[0]);
+  Serial.printf("-- holding registers, Modbus address %u --\n", addr);
+  uint8_t answered = 0;
+  for (uint8_t k = 0; k < N; k++) {
+    uint16_t v = 0;
+    if (rtu.readHolding(addr, REG(want[k]), 1, &v)) {
+      Serial.printf("  reg %-3u  0x%04X %6u   %s\n", want[k], v, v, what[k]);
+      answered++;
+    } else {
+      Serial.printf("  reg %-3u    ----   ----   %s (no answer)\n", want[k], what[k]);
+    }
+  }
+  Serial.printf("%u of %u registers answered\n", answered, N);
+}
+
+static int conSplit(const String &s, String *out, int maxN) {
+  int n = 0, i = 0;
+  while (i < (int)s.length() && n < maxN) {
+    while (i < (int)s.length() && s[i] == ' ') i++;
+    int j = i;
+    while (j < (int)s.length() && s[j] != ' ') j++;
+    if (j > i) out[n++] = s.substring(i, j);
+    i = j;
+  }
+  return n;
+}
+
+static void conExec(String s) {
+  s.trim();
+  if (!s.length()) return;
+  String cmd = s, arg = "";
+  int sp = s.indexOf(' ');
+  if (sp > 0) { cmd = s.substring(0, sp); arg = s.substring(sp + 1); arg.trim(); }
+  cmd.toLowerCase();
+
+  if (cmd == "help" || cmd == "?") conHelp();
+  else if (cmd == "status") conStatus();
+  else if (cmd == "log") {
+    gCsvOn = !arg.equalsIgnoreCase("off");
+    Serial.printf("csv %s\n", gCsvOn ? "on" : "off");
+  }
+  else if (cmd == "sim") {
+    simSwitch(!arg.equalsIgnoreCase("off"));
+    saveSettings();
+    Serial.printf("simulation %s\n", S.simOn ? "ON" : "off");
+    if (!S.simOn) Serial.print(lastLog);
+  }
+  else if (cmd == "scan") {
+    if (S.simOn) { Serial.println("simulation is on -- there is no bus to scan"); return; }
+    lastLog = discover();
+    Serial.print(lastLog);
+  }
+  else if (cmd == "regs") conRegs(arg.length() ? (uint8_t)arg.toInt() : drv[0].addr);
+  else if (cmd == "ovr") {
+    if (arg.equalsIgnoreCase("off")) gOvr = false;
+    else { gOvrPct = limitf(0, arg.toFloat(), 100); gOvr = true; }
+    Serial.printf("override %s at %.0f%% = %.1f Hz ceiling\n",
+                  gOvr ? "ENGAGED" : "off", gOvrPct, gOvrPct * 0.6f);
+  }
+  else if (cmd == "hz") {
+    gOvrPct = limitf(0, arg.toFloat() / 0.6f, 100);
+    gOvr    = true;
+    Serial.printf("override ENGAGED at %.0f%% = %.1f Hz ceiling\n",
+                  gOvrPct, gOvrPct * 0.6f);
+  }
+  else if (cmd == "heap") {
+    // Largest FREE BLOCK is the number that matters for serving a page, not
+    // total free: the page copy needs one contiguous allocation.
+    Serial.printf("heap free %u   largest block %u   min free ever %u\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+                  (unsigned)ESP.getMinFreeHeap());
+    Serial.printf("pages: home %u  pump %u  sim %u  net %u  system %u bytes\n",
+                  (unsigned)strlen_P(PAGE_HOME), (unsigned)strlen_P(PAGE_PUMP),
+                  (unsigned)strlen_P(PAGE_SIM),  (unsigned)strlen_P(PAGE_NET),
+                  (unsigned)strlen_P(PAGE_SYSTEM));
+  }
+  else if (cmd == "hold") {
+    gBusHold = !arg.equalsIgnoreCase("off");
+    Serial.printf("bus hold %s -- the control tick %s writing to drives\n",
+                  gBusHold ? "ON" : "off", gBusHold ? "is NOT" : "is");
+  }
+  else if (cmd == "rd") {
+    String t[3];
+    if (conSplit(arg, t, 3) < 2) { Serial.println("usage: rd <addr> <reg> [count]"); return; }
+    uint8_t  a = (uint8_t)t[0].toInt();
+    uint16_t r = (uint16_t)t[1].toInt();
+    uint8_t  c = (uint8_t)limitf(1, t[2].length() ? t[2].toInt() : 1, 8);
+    uint16_t v[8];
+    if (!rtu.readHolding(a, REG(r), c, v)) {
+      Serial.printf("addr %u reg %u x%u: %s\n", a, r, c, rtu.errName()); return;
+    }
+    for (uint8_t k = 0; k < c; k++)
+      Serial.printf("  reg %-3u  0x%04X %6u\n", r + k, v[k], v[k]);
+  }
+  else if (cmd == "wr") {
+    String t[3];
+    if (conSplit(arg, t, 3) < 3) {
+      Serial.println("usage: wr <addr> <reg> <value>   ('hold on' first)"); return;
+    }
+    if (!gBusHold) {
+      Serial.println("refused: 'hold on' first, or the control tick overwrites it within 100 ms");
+      return;
+    }
+    uint8_t  a = (uint8_t)t[0].toInt();
+    uint16_t r = (uint16_t)t[1].toInt();
+    uint16_t v = (uint16_t)t[2].toInt();
+    // Register 1 is the command word.  A raw console is for probing the map,
+    // not for starting motors: the run path is `run`, which goes through the
+    // control block and its limits.
+    if (r == 1 && v != 0) {
+      Serial.println("refused: reg 1 is the command word -- a non-zero value can START the motor");
+      return;
+    }
+    // Function 06 (write single), NOT 16 (write multiple).  The E3 accepts
+    // function 16 for registers 1-4 ONLY, so every parameter write above that
+    // was answered with silence -- which looked like a locked drive and was
+    // actually the wrong function code.
+    bool ok = rtu.writeSingle(a, REG(r), v);
+    Serial.printf("write addr %u reg %u = %u : %s\n", a, r, v,
+                  ok ? "acknowledged" : rtu.errName());
+  }
+  else if (cmd == "man") {
+    if (arg.equalsIgnoreCase("off")) { if (gMan) gEnable = false; gMan = false; }
+    else { gManHz = limitf(0, arg.toFloat(), 60); if (!gMan) gEnable = false; gMan = true; }
+    Serial.printf("manual %s at %.1f Hz (enable %s)\n",
+                  gMan ? "ON" : "off", gManHz, gEnable ? "ON" : "off");
+  }
+  else if (cmd == "sweep") {
+    if (arg.equalsIgnoreCase("abort")) sweepStop("aborted from the console");
+    else if (arg.equalsIgnoreCase("next")) sweepNext();
+    else if (arg.equalsIgnoreCase("dead") || arg.equalsIgnoreCase("open")) {
+      if (S.simOn)         { Serial.println("simulation is on -- no real pump to profile"); return; }
+      if (!drv[0].present) { Serial.println("no drive on the bus"); return; }
+      sweepStart(arg.equalsIgnoreCase("open") ? 1 : 0);
+    } else {
+      for (int m = 0; m < 2; m++) {
+        Serial.println(m ? "-- wide open --" : "-- deadhead --");
+        for (int i = 0; i < SWEEP_STEPS; i++) {
+          SweepRow &w = gSwRow[m][i];
+          if (!w.done) continue;
+          Serial.printf("  %2.0f set %4.1f Hz %6.1f psi %5.2f A %4u V %4u Vbus "
+                        "%6.1f%% %4.1f kW  ai %4u  %d C  flow %.1f%s\n",
+                        SWEEP_HZ[i], w.hzAct, w.psi, w.amps, w.volts, w.vbus,
+                        w.torq / 10.0f, w.powkW / 10.0f, w.ai, w.tempC, w.flow,
+                        w.cav ? "  CAVITATING" : "");
+        }
+      }
+    }
+    Serial.printf("sweep: %s  (step %d/%d, limit %.0f psi)\n",
+                  gSwMsg.c_str(), gSwStep, SWEEP_STEPS, gSwPsiMax);
+  }
+  else if (cmd == "reset") {
+    // Every reflash silences Modbus for ~30 s, so the drive's own P-36
+    // watchdog trips it.  That is the watchdog working, but it leaves a trip
+    // somebody has to clear, and the console had no way to do it.
+    gCmdReset = millis();
+    Serial.println("fault reset pulse queued");
+  }
+  else if (cmd == "run")  { gEnable = true;  Serial.println("enabled"); }
+  else if (cmd == "stop") { gEnable = false; Serial.println("stopped"); }
+  else if (cmd == "sta") {
+    if (!arg.equalsIgnoreCase("clear")) { Serial.println("usage: sta clear"); return; }
+    gNet.ssid[0] = 0;
+    netSave();
+    Serial.println("station SSID blanked -- rebooting so the radio comes up clean");
+    gRebootAt = millis() + 300;
+  }
+  else if (cmd == "reboot") { Serial.println("rebooting"); gRebootAt = millis() + 300; }
+  else Serial.printf("unknown command '%s' -- try help\n", cmd.c_str());
+}
+
+static void conPoll() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') { String l = gConLine; gConLine = ""; conExec(l); }
+    else if (gConLine.length() < 96) gConLine += c;
+  }
+}
+
 // ---------------------------------------------------------------- setup/loop
 void setup() {
   Serial.begin(115200);
@@ -1022,6 +1580,8 @@ void setup() {
 }
 
 void loop() {
+  conPoll();                       // serial console, before the tick gate so it
+                                   // answers at full speed rather than at 10 Hz
   dns.processNextRequest();
 
   // A restart requested from the web UI happens here, not in the handler, so
@@ -1042,6 +1602,8 @@ void loop() {
   pin_.flowValid = S.useFlow;
   pin_.ovrActive = gOvr;
   pin_.ovrHz     = gOvrPct * 0.6f;        // 100 % = 60 Hz
+  pin_.manMode   = gMan;
+  pin_.manHz     = gManHz;
   // One rule for both paths: a lag pump is available when it is fitted, in
   // comms, and not tripped.  Simulation used to skip the trip test, so an
   // injected fault on the lag pump was invisible to staging.
@@ -1135,9 +1697,14 @@ if (S.simOn) {
 }
 
   // ---- 4. CSV for the bench
+  // Runs after the drive has been polled, so each step is recorded from fresh
+  // register data rather than last tick's.
+  sweepTick();
+
   // The per-drive tail is the raw Modbus evidence: what came back from regs
   // 6/7/8 (status, Hz, A) and whether the last read and the last command write
   // were acknowledged.  On the bench this is the whole point of the log.
+  if (gCsvOn)
   Serial.printf("%lu,%.1f,%.1f,%.1f,%.1f,%.1f,%.1f,%s,%d,%d,%d,"
                 "%.1f,%.1f,0x%04X,%d,%d,%.1f,%.1f,0x%04X,%d,%d\n",
     now, pin_.psi, pout.spActive, pout.hzCmd, pout.capHz, pout.shutoffHz,

@@ -3,7 +3,7 @@
 Living document. **Update it at the end of a session, not the start.**
 Read `CLAUDE.md` first (the non-negotiable rules), then this.
 
-Last updated: **2026-09-08**, at `v0.14.0` (`5113762`).
+Last updated: **2026-09-08**, at `v0.20.0`.
 
 ---
 
@@ -11,22 +11,79 @@ Last updated: **2026-09-08**, at `v0.14.0` (`5113762`).
 
 | | |
 |---|---|
-| Firmware on the bench board | `v0.14.0`, real-drive binary (`SIM 0`) |
+| Firmware on the bench board | `v0.20.0`, real-drive binary |
 | Board device id | `5519C4` (MAC-derived — see the `000000` fix in `VERSION.md`) |
-| Simulation | **ON**, 2 pumps, demand 110 gpm, setpoint 55 psi |
-| Station Wi-Fi | joined `google`, was `192.168.1.44`, `pumpsaver.local` |
-| MQTT | pointed at `mqtt.thingsboard.cloud:1883`, ThingsBoard mode ON, **access token not yet entered** |
-| Repo | `master` == `origin/master`, clean tree |
+| Simulation | **OFF** — talking to a real drive |
+| Real drive | answers at **Modbus address 2**, reads + writes verified, `0x0040` ready |
+| Station Wi-Fi | **cleared** (`sta clear`). AP only: **FCW-PUMP**, http://192.168.4.1 |
+| MQTT | staged for ThingsBoard, **needs station Wi-Fi again before it can publish** |
 
-**Away from that network the board will not find `google`**, so `pumpsaver.local`
-will not resolve. Its own AP is always up: join **FCW-PUMP** and use
-**http://192.168.4.1**. That is by design — the AP is how you reach a board
-while standing in front of it, whatever the site network is doing.
+**A serial bench console now exists** — it is how most of this session was driven.
+Plug in USB and type `help`. It matters because a laptop with one radio cannot join
+FCW-PUMP without giving up the network it is already on.
 
-> The bench Wi-Fi password is stored in the board's NVS (it was needed to reach
-> a broker). Blank the SSID field on `/network` to remove it.
+> Station Wi-Fi was cleared because a configured-but-absent SSID makes the station
+> retry forever, and the softAP follows it across channels — so the AP is hardest to
+> join exactly when it is the only way in. Set an SSID again before any MQTT work.
+
+## The E3, now that we have the manual
+
+`MODBUS_E3.md` is the reference — **read it before writing any drive code.** It exists
+because this session lost hours to three wrong guesses, all now recorded there:
+
+- **Function 16 works on registers 1–4 only.** Every parameter write failed for this
+  reason and looked like a locked drive. Parameter writes need **function 06**.
+- **Registers 129/130 are NOT P-01/P-02.** The `128 + P` formula is documented for
+  **P-04 upward only**. The keypad reads P-02 = 18.0 while register 130 reads 3480.
+- **P-12 = 3 was never the fault** — 3 and 4 are both valid Modbus control modes.
+
+Two things from the manual we have **not** verified on this drive:
+
+- **P-31 must be 0 or 1** or Modbus run/stop silently stays with the control terminals.
+  Never read it. Worth two minutes on the keypad.
+- **P-12 = 3 still requires the hardware enable on DI1** (terminals 1–2 linked).
+
+**Register 2006 is motor torque.** This file's own flow-estimation section called that
+the highest-leverage open item; it was in the map all along, and the sweep captures it
+now along with motor volts (2014), DC bus (23) and power (2004).
+
+## The drive ignores a low speed reference — solved
+
+Symptom: the board commanded 4.5 Hz, the motor ran 54. The board was right the whole
+time; `/status` echoes registers 1 and 2 back from the drive so the gap is visible now.
+Cause is **P-02 minimum speed**, currently **18.0 Hz** — the drive clamps our reference
+up to its own floor. **Set P-02 = 0 for the manual slider to have authority below 18 Hz.**
 
 ---
+
+## Next, in order
+
+1. **Set P-02 = 0 on the keypad** (P-14 = 101 unlocks). Nothing below 18 Hz works until then.
+2. **Run both sweeps on `/cal`** — deadhead, then wide open with gpm typed in per row.
+   Download the CSV. That data yields `shutoffPsiAt60` (currently an **unverified 84**
+   feeding the cap table, the sleep thresholds and the envelope plot), suction pressure
+   from the same fit, the process gain that sets `kp`, and a measured cap table.
+3. **Then** tune. Agreed and not yet done: filter the PI feedback (it reads raw pressure
+   while only the cap gets the low-pass), the cap ramp-up rate (3 Hz/s up vs 10 down),
+   shorter sleep timings for bench work, and the drive's own P-03 accel of 5.0 s —
+   probably the largest single contributor to "slow to wind up", and a drive parameter,
+   not firmware.
+
+Tuning before step 2 means fitting gains to a curve nobody has measured.
+
+## Known, unexplained
+
+- **`/pump` sometimes will not load.** Blamed on heap fragmentation, then measured:
+  163 KB largest free block against a 41 KB page. **That theory was wrong.** Pages moved
+  to `send_P` anyway (streams from flash, no 40 KB heap copy) but the root cause is open.
+- **VFD noise kills the USB console whenever the motor runs.** Three times, including
+  mid-test with the port dropping entirely. A ferrite on the USB lead and routing it away
+  from the motor cable would help; for anything with a pump turning, prefer the web UI.
+- **The transducer reads garbage.** 0.2–6.8 psi dithering at rest, and 26.2 psi observed
+  while the motor turned 9.6 Hz — where affinity from an 84 psi shutoff allows about 2.1.
+  `gPsiValid` is **true** throughout: `ai <= 1000` accepts 0 counts as a valid 0 psi, so a
+  failed-open 4–20 mA loop is indistinguishable from a real reading. That is the case
+  where a pump runs to cap chasing a setpoint it cannot see. **Still unfixed.**
 
 ## The one live thread
 
@@ -139,6 +196,23 @@ can happen.
 
 ## Bench tools
 
+**Serial console** — USB CDC, type `help`. Non-blocking, polled before the tick gate,
+so it cannot stall control:
+
+```
+log on|off          the 10 Hz CSV stream (mute it to read anything)
+status              firmware, mode, override, drives, register echo
+scan | regs [addr]  rescan the bus | raw register dump
+hold on|off         stop the control tick writing, for a raw probe
+rd <a> <r> [n]      read registers      wr <a> <r> <v>   write one (needs hold)
+man off|<hz>        MANUAL speed, PI and cap bypassed
+ovr off|<pct>       max-Hz override
+run | stop | reset  enable | disable | clear a drive trip
+sweep dead|open|next|abort|show
+sta clear           blank the station SSID (escape a retry storm)
+heap | reboot
+```
+
 ```
 .\build.ps1              compile          ~11 s warm, ~97 s cold
 .\build.ps1 -Upload      compile + flash COM5
@@ -169,7 +243,17 @@ Requires the board in **station** mode; MQTT does not publish from the AP.
 ## Things that have bitten, so they do not bite twice
 
 - **COM5 "busy or doesn't exist" on upload** is usually transient. Wait a few
-  seconds and retry; it took three attempts once.
+  seconds and retry; it took three attempts once. Confirmed again this session.
+- **Every reflash trips the drive.** Modbus goes silent for ~30 s and the P-36
+  watchdog does its job — trip **50**, `SC-F01`. Not a fault: run `reset`.
+- **Building from the Arduino IDE with USB CDC On Boot disabled** fails as
+  *"'class HardwareSerial' has no member named setTxTimeoutMs"*, which points nowhere
+  near the cause. A `#error` now names the menu option. Deleting that call to silence
+  it would produce a board that flashes fine and comes up mute on USB.
+- **A `<button id="x" onclick="x()">` shadows its own function.** The id-collision
+  linter caught this twice in one session. Name the element `xBtn`.
+- **A 1 Hz poll that rewrites `innerHTML` destroys the input being typed into.**
+  Render only when the data changed and nothing inside has focus.
 - **Undefined core symbols** (`micros`, `String`, `app_main`) at link time means
   a stale build dir. Delete `%LOCALAPPDATA%\Temp\pumpsaver-build*`; `-Clean`
   alone is not always enough.
@@ -188,6 +272,7 @@ Requires the board in **station** mode; MQTT does not publish from the AP.
 | File | What it holds |
 |---|---|
 | `CLAUDE.md` | non-negotiable rules and why each exists |
+| `MODBUS_E3.md` | the E3 register map, control word, parameter access, trip codes |
 | `DESIGN_NOTES.md` | control decisions; why speed is a bad proxy for flow |
 | `ECOSYSTEM.md` | multi-node addressing, the standalone rule, roles, build order |
 | `VERSION.md` | every version, what changed, whether it was flashed |

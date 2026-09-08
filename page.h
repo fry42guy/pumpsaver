@@ -25,6 +25,7 @@
 #include "ui_common.h"
 #include "page_home.h"
 #include "page_pump.h"
+#include "page_cal.h"
 #include "page_sim.h"
 #include "page_net.h"
 #include "page_system.h"

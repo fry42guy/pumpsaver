@@ -102,7 +102,7 @@ const char PAGE_HOME[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset
 </section>
 
 </main><script>)HTML" NAV_JS R"HTML(
-const SN=['Idle','Filling','Regulating','At cap','Charging','Asleep','Both pumps','FAULT'];
+const SN=['Idle','Filling','Regulating','At cap','Charging','Asleep','Both pumps','FAULT','Manual'];
 const CLS=['slp','run','run','warn','run','slp','run','bad'];
 let hist=[],spSet=null,spT=null;
 
@@ -200,7 +200,10 @@ async function tick(){
   $('mup').textContent=hhmm(j.up);
 
   let txt,cls='ok';
-  if(!j.psiValid){txt='Pressure reading invalid — pumps held stopped';cls='bad';}
+  // Manual first: with the pressure loop bypassed, "pressure invalid" is an
+  // expected state rather than the reason anything is being held.
+  if(j.man){txt='MANUAL '+j.manHz.toFixed(1)+' Hz — cap and pressure loop bypassed';cls='warn';}
+  else if(!j.psiValid){txt='Pressure reading invalid — pumps held stopped';cls='bad';}
   else if(j.state==7){txt='Fault — check the drives above';cls='bad';}
   else if(j.ovr){txt='Max-Hz override engaged at '+j.ovrPct+'% — cap bypassed';cls='warn';}
   else if(j.addr1){txt='Uncommissioned drive answering at address 1';cls='warn';}

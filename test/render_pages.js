@@ -58,7 +58,7 @@ const M = macros();
 console.log('macros:', Object.keys(M).join(', '));
 
 let bad = 0;
-for (const [file, name] of [['page_home.h','home'],['page_pump.h','pump'],['page_sim.h','sim'],['page_net.h','net'],['page_system.h','system']]) {
+for (const [file, name] of [['page_home.h','home'],['page_pump.h','pump'],['page_cal.h','cal'],['page_sim.h','sim'],['page_net.h','net'],['page_system.h','system']]) {
   const html = page(file, M);
   fs.writeFileSync(path.join(OUT, name + '.html'), html);
 

@@ -22,7 +22,8 @@
 
 enum PumpState {
   STATE_IDLE = 0, STATE_FILL = 1, STATE_REGULATE = 2, STATE_CAPPED = 3,
-  STATE_CHARGING = 4, STATE_ASLEEP = 5, STATE_STAGED = 6, STATE_FAULT = 7
+  STATE_CHARGING = 4, STATE_ASLEEP = 5, STATE_STAGED = 6, STATE_FAULT = 7,
+  STATE_MANUAL = 8
 };
 
 static inline float limitf(float lo, float v, float hi) {
@@ -128,6 +129,13 @@ struct PumpIn {
      is active so what you dial in is what the pump runs. */
   bool  ovrActive = false;
   float ovrHz     = 60.0f;
+
+  /* Manual mode.  The commanded speed IS manHz -- no PI, no cavitation cap, no
+     sleep, no staging.  Bench and commissioning use: proving a drive, sweeping
+     a pump curve, checking rotation.  Like ovrActive it lives here rather than
+     in PumpCfg so it cannot be persisted. */
+  bool  manMode   = false;
+  float manHz     = 0.0f;
 };
 
 struct PumpOut {
@@ -235,6 +243,36 @@ public:
       floorEff = 0.0f;
     }
 
+    // ----------------------------------------------------------- 2b. MANUAL
+    // The slider IS the speed command: no PI, no cavitation cap, no sleep, no
+    // staging.  An operator dragging a slider has to get the number on the
+    // slider, and the house rule is that a command from outside is passed
+    // verbatim rather than filtered.
+    //
+    // Deliberately NOT gated on psiValid.  Everywhere else a dead transducer
+    // freezes the loop, because everywhere else the loop is steering on that
+    // measurement.  Manual is the mode you need precisely when the transducer
+    // is missing or lying -- commissioning a pump, proving a drive, checking
+    // rotation.  The operator is the feedback path, so the UI has to say so.
+    if (in.manMode) {
+      float h = limitf(0.0f, in.manHz, 60.0f);
+      hzCmd      = h;
+      pidI       = h;         // leave the integrator and the ramp somewhere
+      spEff      = psiUse;    // sane, so returning to auto does not jump
+      sleepStage = 0;
+      lagOn      = false;
+      out.hzCmd     = hzCmd;
+      out.capHz     = capHz;        // still the REAL cap, reported not applied
+      out.shutoffHz = shutoffHz;
+      out.spActive  = spActive;
+      out.runLead   = in.enable && (h > 0.0f);
+      out.runLag    = false;
+      out.state     = STATE_MANUAL;
+      d.sp = sp; d.spActive = spActive; d.spEff = spEff; d.psiUse = psiUse;
+      d.raw = h; d.err = 0; d.pTerm = 0; d.clamp = 0; d.capTarget = capHz;
+      return;
+    }
+
     // ------------------------------------------------------------ 3. SLEEP
     // Thresholds measured from the shutoff speed track the setpoint; phase 2
     // gets its own because the charge target has a higher shutoff of its own.
@@ -271,7 +309,17 @@ public:
       case 0:
         if (tSleepP1.q) {
           if (cfg.sleepBoost <= 0.1f) { sleepStage = 2; sleepCycles++; }
-          else                          sleepStage = 1;
+          else {
+            sleepStage = 1;
+            // Start the charge ramp from where the pressure ACTUALLY is, not
+            // from the setpoint.  Phase 1 completes with pressure at or above
+            // setpoint, so leaving spEff at sp means the first stretch of the
+            // charge carries a NEGATIVE error and commands the pump slower --
+            // the wrong direction, for as long as the ramp takes to climb past
+            // the live reading.  Charging is a request for more pressure; it
+            // should never begin by asking for less speed.
+            spEff = fmaxf(spEff, psiUse);
+          }
         }
         break;
       case 1:
@@ -397,6 +445,7 @@ static inline const char* stateName(int s) {
     case STATE_ASLEEP:   return "asleep";
     case STATE_STAGED:   return "staged";
     case STATE_FAULT:    return "FAULT";
+    case STATE_MANUAL:   return "MANUAL";
   }
   return "?";
 }

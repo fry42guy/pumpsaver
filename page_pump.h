@@ -66,6 +66,14 @@ const char PAGE_PUMP[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset
 <input type="number" id="qspv" step="1" min="5" max="100" inputmode="numeric"></div>
 <input type="range" id="qsp" min="5" max="100" step="1">
 
+<h3>Manual speed &mdash; commissioning</h3>
+<div class="fld"><span class="k">Manual mode<i>the slider IS the speed: PI, cavitation cap, sleep and staging all bypassed. Runs with a dead transducer. Never saved; switching modes drops the run demand</i></span>
+<label class="sw"><input type="checkbox" id="manon"><span></span></label></div>
+<div class="sl"><div class="lab"><span>Speed</span><span id="manhz">&mdash;</span></div>
+<input type="range" id="mans" min="0" max="60" step="0.5" value="0">
+<input type="number" id="mansv" min="0" max="60" step="0.5" value="0"></div>
+<div class="hint" id="mandiag">&mdash;</div>
+
 <h3>Max-Hz override &mdash; diagnostic</h3>
 <div class="fld"><span class="k">Engage override<i>replaces the cavitation cap and Max&nbsp;Hz; floor drops to 0; sleep suspended; never saved</i></span>
 <label class="sw"><input type="checkbox" id="ovon"><span></span></label></div>
@@ -207,7 +215,7 @@ those belong to the installation, not to the pump.</p>
 
 </main><script>)HTML" NAV_JS R"HTML(
 const f=$('f');
-const SN=['idle','fill','regulate','capped','charging','asleep','staged','FAULT'];
+const SN=['idle','fill','regulate','capped','charging','asleep','staged','FAULT','MANUAL'];
 let SET=null,trail=[];
 
 // Checkboxes are cosmetic: serialise them back to the 1/0 the endpoint expects.
@@ -311,7 +319,7 @@ function drawDiag(d){
 }
 
 // ---- poll ---------------------------------------------------------------
-let ovDrag=false;
+let ovDrag=false,manDrag=false,manT=null;
 async function tick(){
   const j=await chrome();
   if(!j){$('st').textContent='No link to the controller';$('st').className='alert bad';return;}
@@ -331,7 +339,10 @@ async function tick(){
   $('drv').innerHTML=r;
 
   let s=j.enable?'Enabled':'Disabled',cls='ok';
-  if(!j.psiValid){s='Pressure invalid — pumps held';cls='bad';}
+  // Manual outranks the pressure-invalid line: in manual a dead transducer is
+  // an expected condition, not the reason the pump is being held.
+  if(j.man){s='MANUAL '+j.manHz.toFixed(1)+' Hz — no cap, no pressure loop';cls='warn';}
+  else if(!j.psiValid){s='Pressure invalid — pumps held';cls='bad';}
   else if(j.state==7){s='FAULT';cls='bad';}
   else if(j.ovr){s='Override engaged at '+j.ovrPct+'% — cap bypassed';cls='warn';}
   else if(j.addr1){s+=' — uncommissioned drive at address 1';cls='warn';}
@@ -340,6 +351,16 @@ async function tick(){
 
   if(!ovDrag){$('ovon').checked=j.ovr;$('ovs').value=j.ovrPct;$('ovsv').value=j.ovrPct;}
   $('ovhz').textContent=(j.ovrPct*0.6).toFixed(1)+' Hz';
+  if(!manDrag){$('manon').checked=j.man;$('mans').value=j.manHz;$('mansv').value=j.manHz;}
+  $('manhz').textContent=j.manHz.toFixed(1)+' Hz';
+  // The gap between what the drive is HOLDING (reg 2, our command echoed back)
+  // and what it is DOING (reg 7) is where a drive ignoring its reference shows.
+  const d0=j.drives&&j.drives[0];
+  $('mandiag').textContent=d0&&d0.present
+    ? 'drive echo — reg1 0x'+('000'+d0.cmdW.toString(16).toUpperCase()).slice(-4)
+      +' · reg2 '+d0.refRaw+' = '+(d0.refRaw/10).toFixed(1)+' Hz commanded'
+      +' · drive reports '+d0.hz.toFixed(1)+' Hz, '+d0.amps.toFixed(1)+' A'
+    : 'no drive on the bus';
 
   if(SET){if(j.state!=0&&j.psiValid){trail.push([j.psi,j.hzCmd]);if(trail.length>300)trail.shift();}
           drawGraph(j,SET);}
@@ -382,6 +403,21 @@ $('qspv').addEventListener('change',()=>{$('qsp').value=$('qspv').value;qPush();
 function ovEcho(){$('ovsv').value=$('ovs').value;$('ovhz').textContent=(+$('ovs').value*0.6).toFixed(1)+' Hz';}
 async function ovPush(){ovDrag=false;
  toast(await post('/ovr',{on:swVal($('ovon')),pct:$('ovs').value}));}
+// ---- manual speed --------------------------------------------------------
+// Applies WHILE dragging, debounced, unlike the override above: this is a hand
+// throttle, and a throttle that only answers when you let go is not one. The
+// drive's own accel/decel ramp does the smoothing at the motor.
+function manEcho(){$('mansv').value=$('mans').value;
+ $('manhz').textContent=(+$('mans').value).toFixed(1)+' Hz';}
+async function manPush(){manDrag=false;clearTimeout(manT);
+ toast(await post('/man',{on:swVal($('manon')),hz:$('mans').value}));}
+function manLive(){manDrag=true;manEcho();clearTimeout(manT);
+ manT=setTimeout(()=>post('/man',{on:swVal($('manon')),hz:$('mans').value}),150);}
+$('mans').addEventListener('input',manLive);
+$('mans').addEventListener('change',manPush);
+$('mansv').addEventListener('change',()=>{$('mans').value=$('mansv').value;manEcho();manPush();});
+$('manon').addEventListener('change',manPush);
+
 $('ovs').addEventListener('input',()=>{ovDrag=true;ovEcho();});
 $('ovs').addEventListener('change',ovPush);
 $('ovsv').addEventListener('change',()=>{$('ovs').value=$('ovsv').value;ovEcho();ovPush();});
