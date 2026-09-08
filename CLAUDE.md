@@ -1,5 +1,9 @@
 # Working rules for this repo
 
+**Starting a session?** Read this file, then `HANDOFF.md` — current board state,
+the live thread, and what is open with the reasoning already worked out.
+**Ending one?** Update `HANDOFF.md`.
+
 ## Version bump — every pass, no exceptions
 
 Before finishing any change pass that touches firmware:
@@ -38,6 +42,18 @@ the serial banner, the page header, and `/status`.
 - **Never give an element an `id` that shadows a global.** A bare `id` is reachable
   as a window property, but real window properties win — `id="alert"` resolves to
   `window.alert`, not the element. Same trap that once stopped the Cmd tile updating.
+  Enforced by `node test/id_collide.js`.
+
+- **After touching any `page_*.h` or `ui_common.h`, run the page checks before
+  flashing.** They take seconds and catch what otherwise costs a 30 s build,
+  a flash, and a browser silently doing nothing:
+  ```
+  node test/render_pages.js    # assemble as the preprocessor would; tags, JS syntax,
+                               # every getElementById target exists
+  node test/id_collide.js      # the id-shadowing rule above
+  ```
+  A clean run is not a substitute for `.\build.ps1` — these emulate the
+  preprocessor, they are not it.
 
 - **A form must be able to read back every field it writes.** If a `/xxx` GET does
   not return a field its POST accepts, the form renders it empty and saving writes
