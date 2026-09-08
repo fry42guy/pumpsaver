@@ -33,7 +33,7 @@
 // field can always be matched to a commit.  See VERSION.md for the log.
 // This block must stay ABOVE FW_VERSION_STR below -- that initialiser expands
 // the macro, so defining it afterwards does not compile.
-#define FW_VERSION "0.13.0"
+#define FW_VERSION "0.14.0"
 
 // net.h needs the version string at runtime; the macro is not visible to it.
 const char *FW_VERSION_STR = FW_VERSION;
@@ -430,6 +430,18 @@ String jstr(const char *s) {
 
 // ---------------------------------------------------------------- json
 
+float flowAt(float hz, float psi);   // defined below; .ino prototype
+                                     // generation is not worth relying on
+
+// Identical pumps in parallel at the same speed against the same head each
+// deliver the same flow, so system delivery is n x the single-pump curve.
+// flowAt() is per pump: publishing it raw read 35 gpm with two pumps staged
+// and 70 gpm actually flowing.
+float flowTotal() {
+  int n = (pout.runLead ? 1 : 0) + (pout.runLag ? 1 : 0);
+  return n * flowAt(pout.hzCmd, pin_.psi);
+}
+
 String statusJSON() {
   String j = "{";
   j += "\"ver\":\"" FW_VERSION "\"";
@@ -445,7 +457,8 @@ String statusJSON() {
   // that the board rebooted under them.  Seconds since boot.
   j += ",\"up\":" + String(millis() / 1000UL);
   j += ",\"addr1\":" + String(addr1Occupied ? "true" : "false");
-  j += ",\"flow\":" + String(plant.flowGPM, 1) + ",\"hzAct\":" + String(plant.hzAct, 1);
+  j += ",\"flowEst\":" + String(flowTotal(), 1);
+  j += ",\"flowSim\":" + String(plant.flowGPM, 1) + ",\"hzAct\":" + String(plant.hzAct, 1);
   j += ",\"drives\":[";
   for (int i = 0; i < MAX_DRIVES; i++) {
     if (i) j += ",";
@@ -803,6 +816,12 @@ void setupWeb() {
     c.port   = (uint16_t)limitf(1, argF(r, "port", c.port), 65535);
     c.pubMs  = (uint16_t)limitf(500, argF(r, "pubMs", c.pubMs), 60000);
     c.mqttOn = argF(r, "mqttOn", c.mqttOn ? 1 : 0) > 0.5f;
+    c.tbMode = argF(r, "tbMode", c.tbMode ? 1 : 0) > 0.5f;
+    // Only touched when the form actually sent it.  argF's default would map a
+    // missing param to the current value anyway, but a mask is the one field
+    // where a silent 0 means "publish nothing" -- worth being explicit.
+    if (r->hasParam("pubMask", true))
+      c.pubMask = (uint32_t)strtoul(r->getParam("pubMask", true)->value().c_str(), nullptr, 10);
 
     // ---- identity, AP and addressing (0.10.0) ----
     if (r->hasParam("label", true)) argS(r, "label", c.label, sizeof(c.label));
@@ -1131,10 +1150,26 @@ if (S.simOn) {
   NetTelem tl;
   tl.psi     = pin_.psi;      tl.spAct   = pout.spActive;
   tl.hzCmd   = pout.hzCmd;    tl.cap     = pout.capHz;
-  tl.shutoff = pout.shutoffHz; tl.flow   = plant.flowGPM;
+  tl.shutoff = pout.shutoffHz;
+  // Was plant.flowGPM -- the SIMULATOR's flow, published unconditionally.  With
+  // sim off, plant.step() never runs, so that number was 0 at boot or frozen at
+  // whatever the last simulated value happened to be, and it went into the
+  // historian looking exactly like a measurement.  flowAt() is the affinity-law
+  // curve solved backwards from real pressure and speed: an estimate, but an
+  // honest one, and it works on a real pump.
+  tl.flow    = flowTotal();
   tl.state   = (int)pout.state; tl.sleepStage = pc.sleepStage;
   tl.enable  = pin_.enable;   tl.runLead = pout.runLead;
   tl.runLag  = pout.runLag;   tl.commsOK = drv[0].commsOK;
   tl.psiValid = gPsiValid;    tl.upSec   = now / 1000;
+  tl.a1 = drv[0].amps;        tl.a2 = drv[1].amps;
+  tl.t1 = drv[0].tempC;       tl.t2 = drv[1].tempC;
+  tl.ai1 = drv[0].aiCounts;
+  tl.st1 = drv[0].status;     tl.st2 = drv[1].status;
+  tl.trip1 = drv[0].tripCode; tl.trip2 = drv[1].tripCode;
+  tl.cycles = pc.sleepCycles;   // rssi is filled by the net task: WiFi calls
+                                // do not belong in the control tick.
+  strncpy(tl.stName, stateName(pout.state), sizeof(tl.stName) - 1);
+  tl.stName[sizeof(tl.stName) - 1] = 0;
   netPushTelem(tl);
 }

@@ -93,7 +93,7 @@ const char PAGE_HOME[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset
     <div class="m"><small>Total amps</small><b id="mamp">--<i>A</i></b></div>
     <div class="m"><small>Speed cap</small><b id="mcap">--<i>Hz</i></b></div>
     <div class="m"><small>Shutoff</small><b id="mshz">--<i>Hz</i></b></div>
-    <div class="m"><small>Flow</small><b id="mflow">--<i>gpm</i></b></div>
+    <div class="m"><small>Flow (est)</small><b id="mflow">--<i>gpm</i></b></div>
     <div class="m"><small>Sleep cycles</small><b id="mcyc">--</b></div>
     <div class="m"><small>Uptime</small><b id="mup">--</b></div>
   </div>
@@ -195,7 +195,7 @@ async function tick(){
   $('mamp').innerHTML=amps.toFixed(1)+'<i>A</i>';
   $('mcap').innerHTML=j.capHz.toFixed(1)+'<i>Hz</i>';
   $('mshz').innerHTML=j.shutoffHz.toFixed(1)+'<i>Hz</i>';
-  $('mflow').innerHTML=j.flow.toFixed(1)+'<i>gpm</i>';
+  $('mflow').innerHTML=j.flowEst.toFixed(1)+'<i>gpm</i>';
   $('mcyc').textContent=j.sleepCycles;
   $('mup').textContent=hhmm(j.up);
 
@@ -209,7 +209,7 @@ async function tick(){
   else txt='Enabled — holding '+j.spActive.toFixed(1)+' psi';
   $('banner').textContent=txt;$('banner').className='alert '+cls;
 
-  if(j.psiValid){hist.push([j.psi,j.hzCmd,j.flow]);if(hist.length>150)hist.shift();}
+  if(j.psiValid){hist.push([j.psi,j.hzCmd,j.flowEst]);if(hist.length>150)hist.shift();}
   trendDraw(spSet||j.spActive);
 }
 

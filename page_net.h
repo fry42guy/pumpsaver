@@ -85,13 +85,27 @@ refused rather than truncated into something that looks plausible.</p>
 <div class="fld"><span class="k">Publish telemetry</span>
 <label class="sw"><input type="checkbox" id="mqttOn"><span></span></label></div>
 <fieldset id="mqFs">
-<div class="fld"><span class="k">Broker host</span><input id="host" maxlength="63" placeholder="10.0.0.5"></div>
+<div class="fld"><span class="k">Broker host<i>hostname or IP</i></span>
+<input id="host" maxlength="63" placeholder="mqtt.thingsboard.cloud" autocapitalize="off"
+ autocorrect="off" spellcheck="false"></div>
 <div class="fld"><span class="k">Port</span><input type="number" id="port" min="1" max="65535" inputmode="numeric"></div>
-<div class="fld"><span class="k">Username<i>blank if none</i></span><input id="user" maxlength="32"></div>
+<div class="fld"><span class="k">ThingsBoard device<i>token in Username, Password blank</i></span>
+<label class="sw"><input type="checkbox" id="tbMode"><span></span></label></div>
+<div class="fld"><span class="k">Username<i>blank if none</i></span><input id="user" maxlength="32"
+ autocapitalize="off" autocorrect="off" spellcheck="false"></div>
 <div class="fld"><span class="k">Password<i>blank keeps the stored one</i></span>
 <input id="mpass" type="password" maxlength="64" placeholder="unchanged" autocomplete="new-password"></div>
-<div class="fld"><span class="k">Base topic</span><input id="topic" maxlength="39"></div>
+<div class="fld" id="topicRow"><span class="k">Base topic</span><input id="topic" maxlength="39"></div>
 <div class="fld"><span class="k">Publish every<i>ms</i></span><input type="number" id="pubMs" min="500" max="60000" inputmode="numeric"></div>
+<div class="alert ok" id="tbNote" style="display:none;margin-top:9px"></div>
+
+<h3 style="font-size:13px;margin:15px 0 2px">What gets published</h3>
+<div id="pubList"></div>
+<div class="row" style="margin-top:8px">
+  <button class="ghost sm" onclick="pubAll(1)">All</button>
+  <button class="ghost sm" onclick="pubAll(0)">None</button>
+</div>
+<p class="note" id="pubPrev">&nbsp;</p>
 </fieldset>
 <p class="note">Publish-only. Nothing is subscribed, so nothing on the network can
 start, stop or re-tune a pump.</p>
@@ -105,7 +119,7 @@ restarts.</p>
 
 </main>
 <div class="savebar">
-<button class="ghost" type="button" onclick="loadNet()">Revert</button>
+<button class="ghost" type="button" onclick="revertNet()">Revert</button>
 <button type="button" onclick="saveNet()">Save network</button>
 </div>
 <script>)HTML" NAV_JS R"HTML(
@@ -113,13 +127,87 @@ let scanT=null,lastLog=null;
 const IDS=['label','hostName','apSsid','ssid','sip','gw','mask','dns','host','port',
            'user','topic','pubMs'];
 
+// loadNet polls every 5 s and rewrites every field, so anything half-typed was
+// silently reverted mid-edit. Once the form is touched the poll refreshes the
+// STATUS card only, and leaves the inputs alone until Save or Revert.
+let formDirty=false;
+function markDirty(){formDirty=true;}
+document.addEventListener('input',e=>{if(e.target.closest('main'))markDirty();});
+document.addEventListener('change',e=>{if(e.target.closest('main'))markDirty();});
+
+// Telemetry groups. `bit` must match the enum in net.h -- these are saved in
+// NVS, so renumbering one silently reselects a different set on every board
+// already in the field. `b` is the rough payload cost in bytes.
+const PUBG=[
+  {bit:1,   b:40, k:'Pressure',      d:'psi, setpoint, valid flag'},
+  {bit:2,   b:40, k:'Speed',         d:'commanded Hz, cap, shutoff'},
+  {bit:4,   b:16, k:'Flow estimate', d:'flowEst — curve, not a meter'},
+  {bit:8,   b:58, k:'State',         d:'state, name, sleep stage, enable'},
+  {bit:16,  b:36, k:'Pumps',         d:'lead, lag, comms'},
+  {bit:32,  b:20, k:'Motor amps',    d:'a1, a2 — the wear signal'},
+  {bit:64,  b:18, k:'Drive temps',   d:'t1, t2 heatsink °C'},
+  {bit:128, b:12, k:'AI raw',        d:'ai1 transducer counts'},
+  {bit:256, b:38, k:'Status & trips',d:'status words, trip codes'},
+  {bit:512, b:46, k:'Health',        d:'uptime, sleep cycles, RSSI, firmware'},
+];
+
+let knownBits=0; for(const g of PUBG)knownBits|=g.bit;
+let loadedMask=0xFFFFFFFF;
+
+function renderPub(mask){
+  loadedMask=mask>>>0;
+  $('pubList').innerHTML=PUBG.map(g=>
+    '<div class="fld"><span class="k">'+g.k+'<i>'+g.d+'</i></span>'+
+    '<label class="sw"><input type="checkbox" class="pubck" data-bit="'+g.bit+'"'+
+    ((mask&g.bit)?' checked':'')+'><span></span></label></div>').join('');
+  for(const c of document.querySelectorAll('.pubck'))
+    c.addEventListener('change',pubEcho);
+  pubEcho();
+}
+// Bits this build has no checkbox for are carried through untouched. A newer
+// firmware may define groups above bit 9; saving from an older page must not
+// silently switch them off, which is the same trap as a GET that cannot read
+// back a field its POST accepts.
+function pubMaskVal(){
+  let m=loadedMask & ~knownBits;
+  for(const c of document.querySelectorAll('.pubck'))if(c.checked)m|=+c.dataset.bit;
+  return m>>>0;
+}
+function pubAll(v){
+  for(const c of document.querySelectorAll('.pubck'))c.checked=!!v;
+  markDirty();pubEcho();
+}
+// Revert has to clear the dirty flag or the poll stays frozen on stale edits.
+function revertNet(){formDirty=false;loadNet();}
+// Says what the choice costs. A cloud broker with a data allowance is exactly
+// where someone needs to know this before turning everything on.
+function pubEcho(){
+  const m=pubMaskVal();
+  let bytes=2,n=0;
+  for(const g of PUBG)if(m&g.bit){bytes+=g.b;n++;}
+  const ms=Math.max(500,+$('pubMs').value||5000);
+  const perDay=bytes*(86400000/ms);
+  $('pubPrev').innerHTML=n?(n+' group'+(n>1?'s':'')+' &middot; ~'+bytes+
+    ' B every '+(ms/1000)+' s &middot; ≈'+(perDay/1048576).toFixed(1)+' MB/day'):
+    '<b>Nothing selected</b> — the board will publish an empty object.';
+}
+
 function gate(){
   $('ipFs').disabled=!$('useStatic').checked;
   $('mqFs').disabled=!$('mqttOn').checked;
   $('mdnsEcho').textContent=($('hostName').value||'pumpsaver')+'.local';
+  // ThingsBoard routes on the access token, not the topic. Showing a base
+  // topic box that the firmware then ignores is how someone spends an hour
+  // wondering why a connected broker charts nothing.
+  const tb=$('tbMode').checked;
+  $('topicRow').style.display=tb?'none':'flex';
+  $('tbNote').style.display=tb?'block':'none';
+  if(tb)$('tbNote').innerHTML='Publishing to <b>v1/devices/me/telemetry</b>. '+
+    'Put the device access token in <b>Username</b> and leave Password blank.';
 }
-for(const id of ['useStatic','mqttOn'])$(id).addEventListener('change',gate);
+for(const id of ['useStatic','mqttOn','tbMode'])$(id).addEventListener('change',gate);
 $('hostName').addEventListener('input',gate);
+$('pubMs').addEventListener('input',pubEcho);
 
 const sigBar=r=>'<span class="sig"><i style="width:'+
   Math.max(0,Math.min(100,2*(r+100)))+'%"></i></span>';
@@ -144,13 +232,18 @@ async function loadNet(){
     '<div><span>MAC</span><b>'+j.mac+'</b></div>'+
     (j.log?'<div style="grid-column:1/-1"><span>last event</span><b>'+esc(j.log)+'</b></div>':'');
 
-  for(const k of IDS)if($(k)&&j[k]!==undefined)$(k).value=j[k];
-  // 0.0.0.0 is the "not configured" sentinel -- show it as an empty box, not
-  // as an address someone might think is real.
-  for(const k of ['sip','gw','dns'])if($(k).value=='0.0.0.0')$(k).value='';
-  $('useStatic').checked=j.useStatic;$('mqttOn').checked=j.mqttOn;
-  $('pass').value='';$('mpass').value='';$('apPass').value='';
-  gate();
+  // Status card above is always refreshed; the FORM below only while untouched.
+  if(!formDirty){
+    for(const k of IDS)if($(k)&&j[k]!==undefined)$(k).value=j[k];
+    // 0.0.0.0 is the "not configured" sentinel -- show it as an empty box, not
+    // as an address someone might think is real.
+    for(const k of ['sip','gw','dns'])if($(k).value=='0.0.0.0')$(k).value='';
+    $('useStatic').checked=j.useStatic;$('mqttOn').checked=j.mqttOn;
+    $('tbMode').checked=j.tbMode;
+    renderPub(j.pubMask>>>0);
+    $('pass').value='';$('mpass').value='';$('apPass').value='';
+    gate();
+  }
   // The log line is STATE, not an event: gNetLog holds the boot message for the
   // life of the board, and this function polls every 5 s, so toasting it here
   // popped "AP FCW-PUMP at 192.168.4.1" over and over forever. It belongs in
@@ -195,15 +288,20 @@ async function saveNet(){
       if(badQuad(v)){toast('The '+n+' is not a valid IPv4 address.',1);return;}}
   if($('mqttOn').checked&&!$('host').value.trim()){toast('MQTT needs a broker host.',1);return;}
 
+  if($('mqttOn').checked&&$('tbMode').checked&&!$('user').value.trim()){
+    toast('ThingsBoard authenticates with the device access token in Username.',1);return;}
+
   const b={};
   for(const k of IDS)b[k]=$(k).value.trim();
   b.useStatic=swVal($('useStatic'));b.mqttOn=swVal($('mqttOn'));
+  b.tbMode=swVal($('tbMode'));b.pubMask=pubMaskVal();
   b.hostName=$('hostName').value.trim();
   if($('pass').value)b.pass=$('pass').value;
   if($('mpass').value)b.mpass=$('mpass').value;
   if($('apPass').value)b.apPass=$('apPass').value;
 
   toast(await post('/net',b));
+  formDirty=false;                  // let the poll refresh the form again
   setTimeout(loadNet,1200);
 }
 

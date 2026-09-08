@@ -129,7 +129,7 @@ async function loadSim(){
   if(!on)             txt='Simulation off — running against real drives over Modbus';
   else if(!st.psiValid){txt='Simulation ON — pressure INVALID (lead drive tripped). Loop frozen, pumps held.';cls='bad';}
   else if(!st.enable) {txt='Simulation ON, '+$('simDrives').value+' pump(s) — pump is STOPPED, so the header sits at 0 psi. Press Enable on Home.';cls='warn';}
-  else                {txt='Simulation ON — '+st.psi.toFixed(1)+' psi, '+st.flow.toFixed(1)+
+  else                {txt='Simulation ON — '+st.psi.toFixed(1)+' psi, '+st.flowSim.toFixed(1)+
                            ' gpm, '+st.hzCmd.toFixed(1)+' Hz';cls='warn';}
   $('simst').textContent=txt;$('simst').className='alert '+cls;
 

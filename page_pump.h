@@ -85,17 +85,20 @@ const char PAGE_PUMP[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset
 <div id="marg" style="margin-top:4px"></div></div>
 </section>
 
+<!-- Directly under the plot on purpose.  Dragging demand moves the operating
+     point across the envelope, and a slider you cannot see while watching the
+     graph it drives is a slider you have to scroll to and guess at. -->
+<section id="simsec" style="display:none"><h2>Simulated plant</h2>
+<p class="note" style="margin-top:0">Switch simulation on and off, and pick 1 or 2 pumps,
+on <a href="/sim">Sim</a>.</p>
+)HTML" SIM_PANEL_HTML R"HTML(
+</section>
+
 <section><h2>Diagnostics</h2><div class="dg" id="dg"></div></section>
 
 <section><h2>Drives</h2>
 <table><thead><tr><th>#</th><th>Addr</th><th>Read</th><th>Write</th><th>Hz</th><th>A</th><th>State</th></tr></thead>
 <tbody id="drv"></tbody></table>
-</section>
-
-<section id="simsec" style="display:none"><h2>Simulated plant</h2>
-<p class="note" style="margin-top:0">Switch simulation on and off, and pick 1 or 2 pumps,
-on <a href="/sim">Sim</a>.</p>
-)HTML" SIM_PANEL_HTML R"HTML(
 </section>
 
 <form id="f" onsubmit="return save()">

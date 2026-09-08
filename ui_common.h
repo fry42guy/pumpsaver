@@ -248,7 +248,7 @@ async function simLoad(){const j=await(await fetch('/settings',{cache:'no-store'
  $('sm').value=j.simMode;$('sp2').value=j.simPsi;simEcho();}
 // Live readout, fed from a /status object the page already fetched.
 function simTick(j){$('spsi').innerHTML=j.psi.toFixed(1)+'<i>psi</i>';
- $('fl').innerHTML=j.flow.toFixed(1)+'<i>gpm</i>';
+ $('fl').innerHTML=j.flowSim.toFixed(1)+'<i>gpm</i>';
  $('ha').innerHTML=j.hzAct.toFixed(1)+'<i>Hz</i>';}
 for(const id of ['sd','ts','cg','sp2']){
   $(id).addEventListener('input',simDrag);$(id).addEventListener('change',simDrop);}

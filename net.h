@@ -30,6 +30,8 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
+#include <stdarg.h>
+#include <esp_mac.h>          // esp_read_mac -- see netDeviceId
 
 // ---------------------------------------------------------------- config
 struct NetCfg {
@@ -62,6 +64,35 @@ struct NetCfg {
   char     apPass[65] = "fullcircle";
   char     host_name[24] = "pumpsaver";     // mDNS: pumpsaver.local
   char     label[24]     = "";              // free text, shown in the header
+
+  /* ---- appended in 0.14.0 -- still APPEND ONLY ---------------------------
+     pubMask picks which telemetry groups go out.  Default all-on, because a
+     board that quietly stopped publishing a field a dashboard depends on is
+     worse than one that publishes a field nobody charted.  Turning groups OFF
+     is the deliberate act.
+
+     tbMode switches the topic to ThingsBoard's fixed `v1/devices/me/telemetry`
+     and ignores the base topic.  ThingsBoard does not accept arbitrary topics
+     -- it routes purely on the access token in the MQTT username -- so without
+     this the broker connects, accepts every publish, and shows no data, with
+     nothing anywhere reporting an error.                                   */
+  uint32_t pubMask = 0xFFFFFFFFu;
+  bool     tbMode  = false;
+};
+
+// ---- telemetry groups.  Bit numbers are part of the saved config: append
+// new ones at the end, never renumber, or a saved mask selects the wrong set.
+enum : uint32_t {
+  PUB_PRESSURE = 1u << 0,   // psi, sp, psiValid
+  PUB_SPEED    = 1u << 1,   // hz, cap, shutoff
+  PUB_FLOW     = 1u << 2,   // flowEst  (estimate, not a measurement)
+  PUB_STATE    = 1u << 3,   // state, sleep, enable
+  PUB_PUMPS    = 1u << 4,   // lead, lag, comms
+  PUB_AMPS     = 1u << 5,   // a1, a2
+  PUB_TEMPS    = 1u << 6,   // t1, t2  (drive heatsink)
+  PUB_AI       = 1u << 7,   // ai1 raw counts
+  PUB_TRIPS    = 1u << 8,   // st1/st2 status words, trip1/trip2
+  PUB_HEALTH   = 1u << 9,   // up, fw, rssi, cycles
 };
 
 // ---------------------------------------------------------------- telemetry
@@ -74,7 +105,16 @@ struct NetTelem {
   bool     enable = false, runLead = false, runLag = false;
   bool     commsOK = false, psiValid = false;
   uint32_t upSec = 0;
-};
+  // ---- 0.14.0: what the drives report, so a dashboard can trend the motor
+  // and not just the loop.  amps is the one that predicts a failure.
+  float    a1 = 0, a2 = 0;          // motor current per drive, reg 8
+  float    t1 = 0, t2 = 0;          // heatsink degC per drive, reg 24
+  uint16_t ai1 = 0;                 // lead drive AI1 counts, reg 20
+  uint16_t st1 = 0, st2 = 0;        // raw status words, reg 6
+  uint8_t  trip1 = 0, trip2 = 0;    // decoded trip codes
+  uint32_t cycles = 0;              // sleep cycles -- short-cycling shows here
+  char     stName[12] = "";         // "Regulating" reads better on a dashboard
+};                                  // than "2", and costs 20 bytes of payload
 
 // ---------------------------------------------------------------- state
 extern const char *FW_VERSION_STR;          // set by the .ino
@@ -152,9 +192,15 @@ static void netApplyIp() {
 }
 
 // ---------------------------------------------------------------- helpers
+// Read from efuse, NOT via WiFi.macAddress().  netBegin() calls this before
+// WiFi.softAP(), and until the WiFi stack is up macAddress() hands back six
+// zero bytes -- so every board in the field came up as "000000".  That is the
+// MQTT client id AND the telemetry topic AND the mDNS unit TXT, so two boards
+// on one broker would take turns evicting each other forever, each looking
+// perfectly healthy on its own screen.  esp_read_mac() works before init.
 static void netDeviceId() {
-  uint8_t m[6];
-  WiFi.macAddress(m);
+  uint8_t m[6] = {0};
+  esp_read_mac(m, ESP_MAC_WIFI_STA);
   snprintf(gDevId, sizeof(gDevId), "%02X%02X%02X", m[3], m[4], m[5]);
 }
 
@@ -202,6 +248,10 @@ String netStatusJSON() {
   j += ",\"user\":\"" + String(gNet.user) + "\"";
   j += ",\"topic\":\"" + String(gNet.topic) + "\"";
   j += ",\"pubMs\":" + String(gNet.pubMs);
+  // Read-back, not decoration: the form POSTs these, so it has to be able to
+  // load them or saving writes a zero mask and the board stops publishing.
+  j += ",\"pubMask\":" + String(gNet.pubMask);
+  j += ",\"tbMode\":" + String(gNet.tbMode ? "true" : "false");
   j += ",\"useStatic\":" + String(gNet.useStatic ? "true" : "false");
   j += ",\"sip\":\""  + netQuad(gNet.ip)   + "\"";
   j += ",\"gw\":\""   + netQuad(gNet.gw)   + "\"";
@@ -247,24 +297,78 @@ String netScanJSON() {
 }
 
 // ---------------------------------------------------------------- publish
+// Bounded append.  snprintf returns what it WOULD have written, so adding its
+// return value straight onto an offset walks past the end of the buffer on
+// truncation and every later write lands outside it.  Clamp instead.
+static int jput(char *b, int cap, int n, const char *fmt, ...) {
+  if (n >= cap - 1) return n;
+  va_list ap;
+  va_start(ap, fmt);
+  int w = vsnprintf(b + n, cap - n, fmt, ap);
+  va_end(ap);
+  if (w < 0) return n;
+  n += w;
+  return (n > cap - 1) ? cap - 1 : n;
+}
+
+#define JB(x) ((x) ? "true" : "false")
+
 static void netPublish() {
   NetTelem t;
   portENTER_CRITICAL(&gTelemMux);
   t = gTelem;
   portEXIT_CRITICAL(&gTelemMux);
 
-  char topic[80], payload[420];
-  snprintf(topic, sizeof(topic), "%s/%s/telemetry", gNet.topic, gDevId);
-  snprintf(payload, sizeof(payload),
-    "{\"psi\":%.2f,\"sp\":%.2f,\"hz\":%.2f,\"cap\":%.2f,\"shutoff\":%.2f,"
-    "\"flow\":%.1f,\"state\":%d,\"sleep\":%d,\"enable\":%s,\"lead\":%s,"
-    "\"lag\":%s,\"comms\":%s,\"psiValid\":%s,\"up\":%u,\"fw\":\"%s\"}",
-    t.psi, t.spAct, t.hzCmd, t.cap, t.shutoff, t.flow, t.state, t.sleepStage,
-    t.enable ? "true" : "false", t.runLead ? "true" : "false",
-    t.runLag ? "true" : "false", t.commsOK ? "true" : "false",
-    t.psiValid ? "true" : "false", t.upSec, FW_VERSION_STR);
+  const uint32_t m = gNet.pubMask;
+  char topic[80], p[720];
+  const int cap = sizeof(p);
+  int n = 0;
 
-  gMqtt.publish(topic, payload);
+  // ThingsBoard routes on the access token in the MQTT username and ignores
+  // the topic entirely -- but only accepts this one.  Publish elsewhere and it
+  // connects, ACKs every message and charts nothing, silently.
+  if (gNet.tbMode) snprintf(topic, sizeof(topic), "v1/devices/me/telemetry");
+  else             snprintf(topic, sizeof(topic), "%s/%s/telemetry", gNet.topic, gDevId);
+
+  p[n++] = '{';
+  #define SEP (n > 1 ? "," : "")
+
+  if (m & PUB_PRESSURE)
+    n = jput(p, cap, n, "%s\"psi\":%.2f,\"sp\":%.2f,\"psiValid\":%s",
+             SEP, t.psi, t.spAct, JB(t.psiValid));
+  if (m & PUB_SPEED)
+    n = jput(p, cap, n, "%s\"hz\":%.2f,\"cap\":%.2f,\"shutoff\":%.2f",
+             SEP, t.hzCmd, t.cap, t.shutoff);
+  // flowEst, not flow.  There is no meter: this is the affinity-law curve
+  // solved backwards, and naming it as a measurement invites someone to bill
+  // off it.  See the note in netStatusJSON's caller.
+  if (m & PUB_FLOW)
+    n = jput(p, cap, n, "%s\"flowEst\":%.1f", SEP, t.flow);
+  if (m & PUB_STATE)
+    n = jput(p, cap, n, "%s\"state\":%d,\"stateName\":\"%s\",\"sleep\":%d,\"enable\":%s",
+             SEP, t.state, t.stName, t.sleepStage, JB(t.enable));
+  if (m & PUB_PUMPS)
+    n = jput(p, cap, n, "%s\"lead\":%s,\"lag\":%s,\"comms\":%s",
+             SEP, JB(t.runLead), JB(t.runLag), JB(t.commsOK));
+  if (m & PUB_AMPS)
+    n = jput(p, cap, n, "%s\"a1\":%.1f,\"a2\":%.1f", SEP, t.a1, t.a2);
+  if (m & PUB_TEMPS)
+    n = jput(p, cap, n, "%s\"t1\":%.0f,\"t2\":%.0f", SEP, t.t1, t.t2);
+  if (m & PUB_AI)
+    n = jput(p, cap, n, "%s\"ai1\":%u", SEP, t.ai1);
+  if (m & PUB_TRIPS)
+    n = jput(p, cap, n, "%s\"st1\":%u,\"st2\":%u,\"trip1\":%u,\"trip2\":%u",
+             SEP, t.st1, t.st2, t.trip1, t.trip2);
+  // RSSI is read here rather than carried through NetTelem: this runs on the
+  // net task, which is the only place WiFi calls are allowed.
+  if (m & PUB_HEALTH)
+    n = jput(p, cap, n, "%s\"up\":%u,\"cycles\":%u,\"rssi\":%d,\"fw\":\"%s\"",
+             SEP, t.upSec, t.cycles,
+             (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0, FW_VERSION_STR);
+
+  n = jput(p, cap, n, "}");
+  #undef SEP
+  gMqtt.publish(topic, p);
 }
 
 // ---------------------------------------------------------------- the task
@@ -306,7 +410,7 @@ static void netTask(void *) {
     if (gNet.mqttOn && gNet.host[0] && WiFi.status() == WL_CONNECTED) {
       if (!gMqtt.connected() && now >= nextMqttTry) {
         gMqtt.setServer(gNet.host, gNet.port);
-        gMqtt.setBufferSize(512);
+        gMqtt.setBufferSize(1024);   // selective payload can reach ~700 B
         gMqtt.setSocketTimeout(4);
 
         char willTopic[80];
